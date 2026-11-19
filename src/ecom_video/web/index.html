@@ -1,0 +1,207 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark">
+  <title>E-Commerce Video Generator</title>
+  <link rel="stylesheet" href="/static/app.css">
+  <script src="/static/app.js" defer></script>
+</head>
+<body>
+  <div class="app-shell">
+    <aside class="sidebar" aria-label="Workspace">
+      <a class="brand" href="/" aria-label="E-Commerce Video Generator home">
+        <span class="brand-mark" aria-hidden="true"><i></i><b></b></span>
+        <span class="brand-copy"><strong>E-Commerce Video Generator</strong><small>LOCAL GENERATION STUDIO</small></span>
+      </a>
+      <button class="new-project" id="newProject" type="button"><span aria-hidden="true">＋</span> New creation</button>
+      <div class="sidebar-rule"></div>
+      <div class="sidebar-section-title"><span>RECENT WORK</span><span class="local-pip" aria-label="Stored locally"></span></div>
+      <nav id="historyList" class="history-list" aria-label="Recent projects">
+        <p class="history-empty">Your recent projects will appear here.</p>
+      </nav>
+      <div class="sidebar-bottom">
+        <div class="privacy-mark"><span aria-hidden="true">◉</span><div><strong>Local workspace</strong><small>Files stored locally</small></div></div>
+        <p>Creative tools for product footage.</p>
+      </div>
+    </aside>
+
+    <main class="main-content">
+      <header class="topbar">
+        <div class="breadcrumb"><span>WORKSPACE</span><span class="breadcrumb-slash">/</span><strong id="topbarTitle">New creation</strong></div>
+        <div class="connection-state"><span class="connection-dot"></span> LOCAL SESSION</div>
+      </header>
+
+      <div class="page-wrap">
+        <section class="page-heading">
+          <div>
+            <p class="eyebrow">REFERENCE-BASED PRODUCTION <span>·</span> SILENT BY DEFAULT</p>
+            <h1>Create from a <em>reference.</em></h1>
+            <p class="page-intro">Bring a video, add your direction, and shape it into individual product clips.</p>
+          </div>
+          <div class="heading-index"><span>01</span><span class="heading-index-rule"></span><span>LOCAL STUDIO</span></div>
+        </section>
+
+        <div class="workbench">
+          <div class="creation-column">
+            <form id="creationForm" novalidate>
+              <section class="panel plan-input-panel">
+                <label>Creation mode <select id="creationMode"><option value="reference">Reference Recreation</option><option value="original">Original Concept</option></select></label>
+                <label id="hookField">Creative hook <select id="hookType"><option value="recommend">Recommend a hook</option><option value="wet_works">Wet Works</option><option value="countdown_reveal">3-2-1 Reveal</option><option value="gifting">Gifting</option><option value="custom">Custom</option></select></label>
+              </section>
+              <section class="panel input-panel" aria-labelledby="referenceHeading">
+                <div class="section-heading">
+                  <div class="section-number">01</div>
+                  <div><h2 id="referenceHeading">Reference video</h2><p>Start with the clip whose structure you want to reinterpret.</p></div>
+                  <span class="required-tag">REQUIRED</span>
+                </div>
+                <input id="videoInput" name="reference_video" type="file" accept="video/mp4,video/quicktime,.mp4,.mov" hidden>
+                <button id="videoDrop" class="drop-zone video-drop" type="button" aria-label="Choose or drop a reference video">
+                  <span class="upload-glyph" aria-hidden="true"><svg viewBox="0 0 24 24"><path d="M12 16V4m0 0L7.5 8.5M12 4l4.5 4.5M5 15.5v3A1.5 1.5 0 0 0 6.5 20h11a1.5 1.5 0 0 0 1.5-1.5v-3"/></svg></span>
+                  <span class="drop-copy"><strong>Drop a video here, or <u>browse files</u></strong><small>MP4 or MOV · up to 200 MB</small></span>
+                  <span class="drop-format">MP4&nbsp; / &nbsp;MOV</span>
+                </button>
+                <div class="selected-video" id="selectedVideo" hidden>
+                  <video id="localVideoPreview" controls muted playsinline aria-label="Selected reference video preview"></video>
+                  <div class="selected-video-meta"><span class="file-chip">VIDEO</span><span id="videoFileName"></span><button id="removeVideo" class="text-button" type="button">Remove</button></div>
+                </div>
+              </section>
+
+              <section class="panel input-panel" aria-labelledby="productHeading">
+                <div class="section-heading">
+                  <div class="section-number">02</div>
+                  <div><h2 id="productHeading">Product references <span class="optional-label">OPTIONAL</span></h2><p>Product photos help keep shape, color, and details consistent.</p></div>
+                </div>
+                <input id="productInput" name="product_images" type="file" accept="image/jpeg,image/png,image/webp,.jpg,.jpeg,.png,.webp" multiple hidden>
+                <button id="imageDrop" class="drop-zone image-drop" type="button" aria-label="Choose or drop product images">
+                  <span class="image-upload-glyph" aria-hidden="true">＋</span>
+                  <span class="drop-copy"><strong>Add product photos</strong><small>JPG, PNG, WebP · up to 16 images</small></span>
+                  <span class="browse-link">Browse</span>
+                </button>
+                <div id="imagePreviews" class="image-previews" aria-live="polite"></div>
+              </section>
+
+              <section class="panel input-panel" aria-labelledby="directionHeading">
+                <div class="section-heading">
+                  <div class="section-number">03</div>
+                  <div><h2 id="directionHeading">Creative direction</h2><p>Describe the changes naturally. The reference provides the visual rhythm.</p></div>
+                </div>
+                <label class="visually-hidden" for="instructions">Creative instructions</label>
+                <textarea id="instructions" name="instructions" rows="5" maxlength="20000" placeholder="Use this video's creative structure, but feature my product. Change the model and setting while keeping the demonstration realistic…"></textarea>
+                <div class="field-foot"><span>Product details in supplied photos are treated as the visual source of truth.</span><span id="characterCount">0 / 20,000</span></div>
+              </section>
+
+              <section class="panel plan-input-panel" aria-labelledby="formatHeading">
+                <div class="section-heading compact-heading">
+                  <div class="section-number">04</div>
+                  <div><h2 id="formatHeading">Clip format</h2><p>Adjust the number and length before analysis.</p></div>
+                </div>
+                <div class="format-fields">
+                  <label>Planned clips <select id="clipCount"><option value="1">1 clip</option><option value="2">2 clips</option><option value="3" selected>3 clips</option><option value="4">4 clips</option><option value="5">5 clips</option><option value="6">6 clips</option><option value="8">8 clips</option><option value="12">12 clips</option></select></label>
+                  <label>Seconds each <select id="clipSeconds"><option value="3">3 sec</option><option value="5" selected>5 sec</option><option value="8">8 sec</option><option value="10">10 sec</option><option value="12">12 sec</option><option value="15">15 sec</option></select></label>
+                  <div class="format-note"><span class="silent-icon" aria-hidden="true">◌</span> Silent MP4 · vertical 9:16</div>
+                </div>
+              </section>
+              <div class="form-actions"><p id="formError" class="inline-error" role="alert"></p><button id="analyzeButton" class="button button-secondary" type="submit"><span class="button-icon" aria-hidden="true">↗</span> Analyze reference</button></div>
+            </form>
+
+            <section id="interviewSection" class="panel analysis-panel" hidden>
+              <h2>The Creative Director has a few questions</h2><div id="directorQuestions" class="analysis-notes"></div>
+              <form id="answerForm"><label for="interviewAnswer">Your answer</label><textarea id="interviewAnswer" rows="3" required maxlength="20000"></textarea><button class="button button-primary" type="submit">Send answer</button></form>
+            </section>
+
+            <section id="analysisSection" class="panel analysis-panel" hidden aria-labelledby="analysisHeading">
+              <div class="section-heading">
+                <div class="section-number section-number-done">✓</div>
+                <div><h2 id="analysisHeading">Reference analysis</h2><p id="analysisSummary"></p></div>
+              </div>
+              <div id="analysisQuestions" class="analysis-notes"></div>
+              <div class="planned-shots-heading"><h3>Planned clips</h3><span id="plannedShotCount"></span></div>
+              <div id="plannedShots" class="planned-shots"></div>
+              <form id="refinePlanForm" class="plan-refinement" hidden>
+                <label for="refinePlanInput">Refine Creative Plan</label>
+                <textarea id="refinePlanInput" rows="3" maxlength="20000" placeholder="Change the hook, adjust a specific shot, or refine the payoff…"></textarea>
+                <button id="updatePlanButton" class="button button-secondary" type="submit">Update Plan</button>
+                <p class="field-foot">The existing concept, confirmed product facts, and other shots are preserved.</p>
+              </form>
+            </section>
+
+            <section id="imageReviewSection" class="panel analysis-panel image-review-panel" hidden aria-labelledby="imageReviewHeading">
+              <div class="section-heading">
+                <div class="section-number">05</div>
+                <div><h2 id="imageReviewHeading">Starting image review</h2><p>Review the full set. Regenerate only an image that needs a different composition; approved images stay saved.</p></div>
+              </div>
+              <div id="startingImageReview" class="starting-image-review"></div>
+              <div class="image-review-actions"><p class="field-foot">A requested starting-image regeneration costs approximately $0.03. Your existing images and project history are preserved.</p><button id="approveImagesButton" class="button button-primary" type="button">Approve images &amp; generate videos</button></div>
+            </section>
+
+            <section id="resultsSection" class="results-section" hidden aria-labelledby="resultsHeading">
+              <div class="results-heading"><div><p class="eyebrow">OUTPUTS <span>·</span> LOCAL HISTORY</p><h2 id="resultsHeading">Generated clips</h2></div><span id="completedCount" class="completed-count"></span></div>
+              <div id="clipResults" class="clip-results"></div>
+            </section>
+          </div>
+
+          <aside class="inspector" aria-label="Job status and cost">
+            <section class="inspector-card status-card">
+              <div class="inspector-heading"><span>JOB STATUS</span><span id="statusLamp" class="status-lamp" aria-hidden="true"></span></div>
+              <p id="jobStatusTitle" class="job-status-title">Waiting for a reference</p>
+              <p id="jobStatusMessage" class="job-status-message">Choose a video to begin.</p>
+              <div class="progress-list" id="progressList">
+                <div class="progress-step" data-stage="analyzing_reference"><span class="progress-mark"></span><span>Analyze reference</span><small>01</small></div>
+                <div class="progress-step" data-stage="preparing_images"><span class="progress-mark"></span><span>Prepare starting images</span><small>02</small></div>
+                <div class="progress-step" data-stage="generating_clips"><span class="progress-mark"></span><span>Generate individual clips</span><small>03</small></div>
+                <div class="progress-step" data-stage="processing_outputs"><span class="progress-mark"></span><span>Prepare silent files</span><small>04</small></div>
+                <div class="progress-step" data-stage="completed"><span class="progress-mark"></span><span>Ready to review</span><small>05</small></div>
+              </div>
+              <div id="providerState" class="provider-state" hidden></div>
+            </section>
+
+            <section class="inspector-card cost-card">
+              <div class="inspector-heading"><span>GENERATION ESTIMATE</span><span class="cost-info" title="Estimated cost from configured provider rates">i</span></div>
+              <p class="estimate-total" id="estimateTotal">—<small>USD</small></p>
+              <p id="estimateDescription" class="estimate-description">Analyze a reference to see the image and video estimate.</p>
+              <div class="cost-lines" id="costLines">
+                <div><span>Reference analysis</span><strong id="analysisCost">~$0.02</strong></div>
+                <div><span>Starting images</span><strong id="imageCost">—</strong></div>
+                <div><span>Video clips</span><strong id="videoCost">—</strong></div>
+              </div>
+              <label class="review-setting"><input id="reviewImagesBeforeVideo" type="checkbox"> <span><strong>Review starting images before generating videos</strong><small>Pause after images are ready so you can inspect or revise them.</small></span></label>
+              <button id="generateButton" class="button button-primary" type="button" disabled><span>Generate clips</span><span aria-hidden="true">↗</span></button>
+              <p class="spend-note" id="spendNote">A reliable total of $1.00 or less runs when you start it. Higher or uncertain estimates ask first.</p>
+            </section>
+
+            <section class="inspector-card spending-card" id="projectSpending" aria-label="Project spending" hidden>
+              <div class="inspector-heading"><span>PROJECT SPENDING</span><span class="cost-info" title="Recorded provider usage equivalents, not verified invoice charges">i</span></div>
+              <p class="spending-total" id="projectSpendingTotal">$0.000000<small>USD</small></p>
+              <p class="spending-note" id="projectSpendingNote"></p>
+              <details class="spending-history">
+                <summary>Spending history <span id="spendingRecordCount"></span></summary>
+                <div class="spending-records" id="spendingRecords"></div>
+              </details>
+            </section>
+
+            <div class="inspector-footer"><span class="footer-lock" aria-hidden="true">⌑</span><p>Local files are sent to OpenAI and Kie only when needed for analysis or generation.</p></div>
+          </aside>
+        </div>
+      </div>
+    </main>
+  </div>
+
+  <dialog id="approvalDialog" class="approval-dialog">
+    <form method="dialog" class="dialog-close-row"><button class="icon-button" aria-label="Close dialog">×</button></form>
+    <p class="eyebrow">SPENDING CONFIRMATION</p>
+    <h2>Confirm this generation</h2>
+    <p id="approvalCopy">This job is above the automatic generation threshold.</p>
+    <div class="dialog-estimate"><span>Estimated total</span><strong id="approvalEstimate"></strong></div>
+    <div class="dialog-actions"><button id="cancelApproval" class="button button-secondary" type="button">Cancel</button><button id="confirmApproval" class="button button-primary" type="button">Confirm &amp; generate</button></div>
+  </dialog>
+  <dialog id="deleteProjectDialog" class="approval-dialog delete-project-dialog" aria-labelledby="deleteProjectHeading">
+    <p class="eyebrow">PERMANENT PROJECT DELETION</p>
+    <h2 id="deleteProjectHeading">Delete <span id="deleteProjectName"></span>?</h2>
+    <p>This permanently removes the project's saved creative plans, interview history, generated videos, starting images, and local project files. This cannot be undone.</p>
+    <div class="dialog-actions"><button id="cancelDeleteProject" class="button button-secondary" type="button">Cancel</button><button id="confirmDeleteProject" class="button button-danger" type="button">Delete Project</button></div>
+  </dialog>
+  <div id="toast" class="toast" role="status" aria-live="polite"></div>
+</body>
+</html>
