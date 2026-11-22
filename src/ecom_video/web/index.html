@@ -18,6 +18,11 @@
       <button class="new-project" id="newProject" type="button"><span aria-hidden="true">＋</span> New creation</button>
       <div class="sidebar-rule"></div>
       <div class="sidebar-section-title"><span>RECENT WORK</span><span class="local-pip" aria-label="Stored locally"></span></div>
+      <div class="history-tools">
+        <button id="selectCompletedProjects" type="button">Select completed</button>
+        <button id="deleteSelectedProjects" type="button" disabled>Delete selected</button>
+        <small id="storageSummary">Managed storage: calculating…</small>
+      </div>
       <nav id="historyList" class="history-list" aria-label="Recent projects">
         <p class="history-empty">Your recent projects will appear here.</p>
       </nav>
@@ -30,7 +35,7 @@
     <main class="main-content">
       <header class="topbar">
         <div class="breadcrumb"><span>WORKSPACE</span><span class="breadcrumb-slash">/</span><strong id="topbarTitle">New creation</strong></div>
-        <div class="connection-state"><span class="connection-dot"></span> LOCAL SESSION</div>
+        <div class="topbar-actions"><small id="currentProjectStorage" hidden></small><button id="deleteCurrentProject" type="button" hidden>Delete Project</button><div class="connection-state"><span class="connection-dot"></span> LOCAL SESSION</div></div>
       </header>
 
       <div class="page-wrap">
@@ -48,7 +53,7 @@
             <form id="creationForm" novalidate>
               <section class="panel plan-input-panel">
                 <label>Creation mode <select id="creationMode"><option value="reference">Reference Recreation</option><option value="original">Original Concept</option></select></label>
-                <label id="hookField">Creative hook <select id="hookType"><option value="recommend">Recommend a hook</option><option value="wet_works">Wet Works</option><option value="countdown_reveal">3-2-1 Reveal</option><option value="gifting">Gifting</option><option value="custom">Custom</option></select></label>
+                <label id="hookField">Creative format <select id="hookType"><option value="recommend">Automatic — let the Creative Director choose</option><option value="in_store_reaction" title="Immediate shopper reaction, quick product reveal, then product-specific story scenes">In-Store Reaction</option><option value="countdown_reveal">3-2-1 Reveal</option><option value="gifting">Gifting</option><option value="versus">Versus</option><option value="custom">Custom</option></select></label>
               </section>
               <section class="panel input-panel" aria-labelledby="referenceHeading">
                 <div class="section-heading">
@@ -98,9 +103,9 @@
                   <div><h2 id="formatHeading">Clip format</h2><p>Adjust the number and length before analysis.</p></div>
                 </div>
                 <div class="format-fields">
-                  <label>Planned clips <select id="clipCount"><option value="1">1 clip</option><option value="2">2 clips</option><option value="3" selected>3 clips</option><option value="4">4 clips</option><option value="5">5 clips</option><option value="6">6 clips</option><option value="8">8 clips</option><option value="12">12 clips</option></select></label>
-                  <label>Seconds each <select id="clipSeconds"><option value="3">3 sec</option><option value="5" selected>5 sec</option><option value="8">8 sec</option><option value="10">10 sec</option><option value="12">12 sec</option><option value="15">15 sec</option></select></label>
-                  <div class="format-note"><span class="silent-icon" aria-hidden="true">◌</span> Silent MP4 · vertical 9:16</div>
+                  <label>Planned clips <select id="clipCount"><option value="director">Director decides</option><option value="1">1 clip</option><option value="2">2 clips</option><option value="3" selected>3 clips</option><option value="4">4 clips</option><option value="5">5 clips</option><option value="6">6 clips</option><option value="8">8 clips</option><option value="12">12 clips</option></select></label>
+                  <label>Seconds each <select id="clipSeconds"><option value="director">Director decides</option><option value="3">3 sec</option><option value="5" selected>5 sec</option><option value="8">8 sec</option><option value="10">10 sec</option><option value="12">12 sec</option><option value="15">15 sec</option></select></label>
+                  <div class="format-note"><span class="silent-icon" aria-hidden="true">◌</span> Per-clip audio · vertical 9:16</div>
                 </div>
               </section>
               <div class="form-actions"><p id="formError" class="inline-error" role="alert"></p><button id="analyzeButton" class="button button-secondary" type="submit"><span class="button-icon" aria-hidden="true">↗</span> Analyze reference</button></div>
@@ -133,6 +138,16 @@
                 <div><h2 id="imageReviewHeading">Starting image review</h2><p>Review the full set. Regenerate only an image that needs a different composition; approved images stay saved.</p></div>
               </div>
               <div id="startingImageReview" class="starting-image-review"></div>
+              <details class="starting-image-checklist">
+                <summary>Starting-image review checklist</summary>
+                <div class="starting-image-checklist-grid">
+                  <p><strong>Reference and setting</strong><br>Right people, product, scene, lighting, and recognizable environment; product-photo backgrounds do not replace the scene.</p>
+                  <p><strong>Frame zero</strong><br>Show the true opening state. Later drops, reveals, setup, opening, or activation have not happened yet.</p>
+                  <p><strong>Continuity and space</strong><br>Faces, wardrobe, product details, gaze, product position, and planned camera movement make sense together.</p>
+                  <p><strong>Physical realism</strong><br>Hands, held objects, support, and pose can plausibly continue into the planned action.</p>
+                </div>
+                <p class="field-foot">Use your visual judgment for subtle issues. This checklist does not run paid image analysis or block approval.</p>
+              </details>
               <div class="image-review-actions"><p class="field-foot">A requested starting-image regeneration costs approximately $0.03. Your existing images and project history are preserved.</p><button id="approveImagesButton" class="button button-primary" type="button">Approve images &amp; generate videos</button></div>
             </section>
 
@@ -151,7 +166,7 @@
                 <div class="progress-step" data-stage="analyzing_reference"><span class="progress-mark"></span><span>Analyze reference</span><small>01</small></div>
                 <div class="progress-step" data-stage="preparing_images"><span class="progress-mark"></span><span>Prepare starting images</span><small>02</small></div>
                 <div class="progress-step" data-stage="generating_clips"><span class="progress-mark"></span><span>Generate individual clips</span><small>03</small></div>
-                <div class="progress-step" data-stage="processing_outputs"><span class="progress-mark"></span><span>Prepare silent files</span><small>04</small></div>
+                <div class="progress-step" data-stage="processing_outputs"><span class="progress-mark"></span><span>Prepare clip files</span><small>04</small></div>
                 <div class="progress-step" data-stage="completed"><span class="progress-mark"></span><span>Ready to review</span><small>05</small></div>
               </div>
               <div id="providerState" class="provider-state" hidden></div>
@@ -166,9 +181,9 @@
                 <div><span>Starting images</span><strong id="imageCost">—</strong></div>
                 <div><span>Video clips</span><strong id="videoCost">—</strong></div>
               </div>
-              <label class="review-setting"><input id="reviewImagesBeforeVideo" type="checkbox"> <span><strong>Review starting images before generating videos</strong><small>Pause after images are ready so you can inspect or revise them.</small></span></label>
+              <label class="review-setting"><input id="reviewImagesBeforeVideo" type="checkbox" checked> <span><strong>Review starting images before generating videos</strong><small>Pause after images are ready so you can inspect or revise them.</small></span></label>
               <button id="generateButton" class="button button-primary" type="button" disabled><span>Generate clips</span><span aria-hidden="true">↗</span></button>
-              <p class="spend-note" id="spendNote">A reliable total of $1.00 or less runs when you start it. Higher or uncertain estimates ask first.</p>
+              <p class="spend-note" id="spendNote">A reliable generation job of $0.50 or less runs when you start it. Higher or uncertain estimates ask first. Each project has a $6.00 ceiling; it is not automatic spend approval.</p>
             </section>
 
             <section class="inspector-card spending-card" id="projectSpending" aria-label="Project spending" hidden>
@@ -200,6 +215,7 @@
     <p class="eyebrow">PERMANENT PROJECT DELETION</p>
     <h2 id="deleteProjectHeading">Delete <span id="deleteProjectName"></span>?</h2>
     <p>This permanently removes the project's saved creative plans, interview history, generated videos, starting images, and local project files. This cannot be undone.</p>
+    <p class="delete-estimate" id="deleteEstimate"></p>
     <div class="dialog-actions"><button id="cancelDeleteProject" class="button button-secondary" type="button">Cancel</button><button id="confirmDeleteProject" class="button button-danger" type="button">Delete Project</button></div>
   </dialog>
   <div id="toast" class="toast" role="status" aria-live="polite"></div>

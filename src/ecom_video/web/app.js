@@ -1,11 +1,12 @@
 (() => {
   const $ = (id) => document.getElementById(id);
   const MAX_INSTRUCTION_LENGTH = 20_000;
-  const state = { job: null, pollTimer: null, videoFile: null, productFiles: [], pendingAction: null, pendingDeleteProjectId: null, toastTimer: null };
+  const DEFAULT_REVIEW_IMAGES_BEFORE_VIDEO = true;
+  const state = { job: null, pollTimer: null, draftTimer: null, savingDraft: false, draftSavePending: false, draftSavePromise: null, videoFile: null, savedVideo: null, removeReferenceVideo: false, productFiles: [], savedProductAssets: [], pendingAction: null, pendingDeleteProjectId: null, pendingDeleteProjectIds: [], selectedProjectIds: new Set(), historyJobs: [], toastTimer: null };
   const activeStates = new Set(['queued', 'analyzing_reference', 'interviewing', 'refining_plan', 'preparing_images', 'generating_clips', 'processing_outputs', 'regenerating', 'regenerating_starting_image']);
   const titles = {
-    queued: 'Queued for analysis', analyzing_reference: 'Creative Director working', interviewing: 'Interview in progress', ready: 'Ready to generate',
-    preparing_images: 'Preparing starting images', generating_clips: 'Generating clips', processing_outputs: 'Preparing silent files',
+    draft: 'Draft saved', queued: 'Queued for analysis', analyzing_reference: 'Creative Director working', interviewing: 'Interview in progress', ready: 'Ready to generate',
+    preparing_images: 'Preparing starting images', generating_clips: 'Generating clips', processing_outputs: 'Preparing clip files',
     refining_plan: 'Refining creative plan', regenerating: 'Regenerating a clip', regenerating_starting_image: 'Regenerating a starting image',
     awaiting_image_review: 'Review starting images', completed: 'Ready to review', failed: 'Job needs attention', interrupted: 'Job interrupted'
   };
@@ -43,7 +44,9 @@
     return Number.isFinite(n) ? `$${n.toFixed(digits)}` : '—';
   }
   function setBusy(busy) {
-    const locked = busy || Boolean(state.job);
+    const locked = busy || Boolean(state.job && state.job.status !== 'draft');
+    $('creationMode').disabled = locked;
+    $('hookType').disabled = locked;
     $('analyzeButton').disabled = locked;
     $('videoDrop').disabled = locked;
     $('imageDrop').disabled = locked;
@@ -51,7 +54,7 @@
     $('videoInput').disabled = locked;
     $('productInput').disabled = locked;
     $('instructions').readOnly = locked;
-    $('reviewImagesBeforeVideo').disabled = busy || Boolean(state.job && !['ready', 'failed', 'interrupted'].includes(state.job.status));
+    $('reviewImagesBeforeVideo').disabled = busy || Boolean(state.job && !['draft', 'ready', 'failed', 'interrupted'].includes(state.job.status));
     $('clipCount').disabled = locked;
     $('clipSeconds').disabled = locked;
     $('generateButton').disabled = busy || !state.job || (state.job.status !== 'ready' && !state.job.can_resume);
@@ -61,6 +64,7 @@
     $('selectedVideo').hidden = !file;
     $('videoDrop').hidden = Boolean(file);
     if (file) {
+      state.savedVideo = null; state.removeReferenceVideo = false;
       $('localVideoPreview').src = URL.createObjectURL(file);
       $('videoFileName').textContent = file.name;
     } else {
@@ -69,22 +73,39 @@
       $('videoInput').value = '';
     }
   }
+  function setSavedVideo(asset) {
+    state.savedVideo = asset || null;
+    if (!asset) { setLocalVideo(null); return; }
+    state.videoFile = null; state.removeReferenceVideo = false;
+    $('selectedVideo').hidden = false; $('videoDrop').hidden = true;
+    $('localVideoPreview').src = asset.url; $('videoFileName').textContent = asset.filename;
+    $('videoInput').value = '';
+  }
   function renderImages() {
     const root = $('imagePreviews');
     root.replaceChildren();
-    state.productFiles.forEach((file, index) => {
+    const items = [
+      ...state.savedProductAssets.map((asset) => ({ asset, name: asset.filename, src: asset.url })),
+      ...state.productFiles.map((file) => ({ file, name: file.name, src: URL.createObjectURL(file) })),
+    ];
+    items.forEach((item) => {
       const wrap = document.createElement('div');
       wrap.className = 'image-preview-wrap';
       const tile = document.createElement('div');
       tile.className = 'image-preview';
       const image = document.createElement('img');
-      image.src = URL.createObjectURL(file);
-      image.alt = file.name;
+      image.src = item.src;
+      image.alt = item.name;
       const remove = document.createElement('button');
-      remove.type = 'button'; remove.setAttribute('aria-label', `Remove ${file.name}`); remove.textContent = '×';
-      remove.addEventListener('click', () => { state.productFiles.splice(index, 1); renderImages(); });
+      remove.type = 'button'; remove.setAttribute('aria-label', `Remove ${item.name}`); remove.textContent = '×';
+      remove.disabled = Boolean(state.job && state.job.status !== 'draft');
+      remove.addEventListener('click', () => {
+        if (item.asset) state.savedProductAssets = state.savedProductAssets.filter((asset) => asset.asset_id !== item.asset.asset_id);
+        else state.productFiles = state.productFiles.filter((file) => file !== item.file);
+        renderImages(); scheduleDraftSave();
+      });
       tile.append(image, remove);
-      const name = document.createElement('span'); name.className = 'image-preview-name'; name.textContent = file.name;
+      const name = document.createElement('span'); name.className = 'image-preview-name'; name.textContent = item.name;
       wrap.append(tile, name); root.append(wrap);
     });
   }
@@ -93,7 +114,7 @@
     if (!file) return;
     if (!/\.(mp4|mov)$/i.test(file.name)) { setError('Choose an MP4 or MOV reference video.'); return; }
     if (file.size > 200 * 1024 * 1024) { setError('The reference video must be 200 MB or smaller.'); return; }
-    setError(''); setLocalVideo(file);
+    setError(''); setLocalVideo(file); scheduleDraftSave(true);
   }
   function useImageFiles(files) {
     const incoming = [...(files || [])];
@@ -103,7 +124,66 @@
     state.productFiles = combined.slice(0, 16);
     if (state.productFiles.length < combined.length) toast('Product photo limit is 16 images.');
     $('productInput').value = '';
-    renderImages();
+    renderImages(); scheduleDraftSave(true);
+  }
+
+  function draftFormData() {
+    const form = new FormData();
+    form.append('mode', $('creationMode').value);
+    form.append('hook', $('hookType').value);
+    form.append('instructions', $('instructions').value);
+    form.append('clip_count', $('clipCount').value);
+    form.append('seconds_per_clip', $('clipSeconds').value);
+    form.append('review_images_before_video', String($('reviewImagesBeforeVideo').checked));
+    form.append('product_asset_ids', JSON.stringify(state.savedProductAssets.map((asset) => asset.asset_id)));
+    form.append('remove_reference_video', String(state.removeReferenceVideo));
+    if (state.videoFile) form.append('reference_video', state.videoFile, state.videoFile.name);
+    state.productFiles.forEach((file) => form.append('product_images', file, file.name));
+    return form;
+  }
+
+  function scheduleDraftSave(immediate = false) {
+    if (state.job && state.job.status !== 'draft') return;
+    if (state.savingDraft) state.draftSavePending = true;
+    $('jobStatusTitle').textContent = 'Saving draft';
+    $('jobStatusMessage').textContent = 'Saving your inputs locally; analysis will wait for your explicit action.';
+    clearTimeout(state.draftTimer);
+    state.draftTimer = setTimeout(() => saveDraft().catch((error) => toast(`Draft not saved: ${error.message}`)), immediate ? 0 : 650);
+  }
+
+  async function saveDraft() {
+    if (state.savingDraft) {
+      await state.draftSavePromise;
+      if (state.draftSavePending) { state.draftSavePending = false; return saveDraft(); }
+      return;
+    }
+    if (state.job && state.job.status !== 'draft') return;
+    state.savingDraft = true;
+    state.draftSavePromise = Promise.resolve();
+    const sentVideo = state.videoFile;
+    const sentImages = [...state.productFiles];
+    const savePromise = (async () => { try {
+      const endpoint = state.job ? `/api/jobs/${state.job.id}/draft` : '/api/drafts';
+      const saved = await request(endpoint, { method: 'POST', body: draftFormData() });
+      state.job = saved;
+      try { localStorage.setItem('ecomVideoCurrentJobId', saved.id); } catch (_) {}
+      const videoWasSaved = state.videoFile === sentVideo;
+      if (videoWasSaved) state.videoFile = null;
+      state.productFiles = state.productFiles.filter((file) => !sentImages.includes(file));
+      state.removeReferenceVideo = false;
+      const savedVideo = saved.inputs.find((asset) => asset.role === 'reference_video') || null;
+      state.savedProductAssets = saved.inputs.filter((asset) => asset.role === 'product_reference');
+      if (videoWasSaved) setSavedVideo(savedVideo);
+      renderImages();
+      $('topbarTitle').textContent = saved.title || 'New creation';
+      $('jobStatusTitle').textContent = titles.draft;
+      $('jobStatusMessage').textContent = 'Draft saved locally. Analysis starts only when you submit it.';
+      setBusy(false);
+      await refreshHistory();
+    } finally { state.savingDraft = false; state.draftSavePromise = null; } })();
+    state.draftSavePromise = savePromise;
+    await savePromise;
+    if (state.draftSavePending) { state.draftSavePending = false; return saveDraft(); }
   }
 
   function updateProgress(job) {
@@ -117,7 +197,7 @@
     const lamp = $('statusLamp');
     lamp.className = `status-lamp${activeStates.has(job.status) ? ' active' : ['completed', 'ready'].includes(job.status) ? ' done' : job.status === 'failed' ? ' error' : ''}`;
     $('jobStatusTitle').textContent = titles[job.status] || 'Job status';
-    $('jobStatusMessage').textContent = job.error || job.message || '';
+    $('jobStatusMessage').textContent = job.resume_operation?.description || job.error || job.message || '';
     $('providerState').hidden = !job.provider_state;
     $('providerState').textContent = job.provider_state ? `Provider: ${job.provider_state}` : '';
   }
@@ -131,13 +211,19 @@
       return;
     }
     $('estimateTotal').innerHTML = `${fmtMoney(estimate.total_usd)}<small>USD</small>`;
-    $('estimateDescription').textContent = `${estimate.clip_count} separate ${estimate.seconds_per_clip}-second clips · ${estimate.total_video_seconds} seconds generated${estimate.intended_edit_seconds ? ` · about ${estimate.intended_edit_seconds}s intended final edit` : ''}`;
+    $('estimateDescription').textContent = `${estimate.clip_count} separate clips · ${estimate.total_video_seconds} seconds generated${estimate.intended_edit_seconds ? ` · about ${estimate.intended_edit_seconds}s intended final edit` : ''}`;
     $('analysisCost').textContent = fmtMoney(estimate.analysis_usd, 4);
     $('imageCost').textContent = fmtMoney(estimate.images_usd, 4);
     $('videoCost').textContent = fmtMoney(estimate.video_usd, 4);
     $('generateButton').disabled = job.status !== 'ready' && !job.can_resume;
-    $('generateButton').title = job.can_resume ? 'Resume from saved tasks and outputs' : job.estimate_reliable ? 'Start the planned generation' : 'Estimate is uncertain; confirmation will be requested';
-    $('generateButton').querySelector('span').textContent = job.can_resume ? 'Resume clips' : 'Generate clips';
+    if (job.resume_operation) {
+      const retryCost = fmtMoney(job.resume_operation.estimated_usd, 2);
+      $('estimateTotal').innerHTML = `${retryCost}<small>USD</small>`;
+      $('estimateDescription').textContent = `Starting image retry only · saved images for other clips will be reused`;
+      $('analysisCost').textContent = '—'; $('imageCost').textContent = retryCost; $('videoCost').textContent = '$0.00';
+    }
+    $('generateButton').title = job.resume_operation?.description || (job.can_resume ? 'Resume from saved tasks and outputs' : job.estimate_reliable ? 'Start the planned generation' : 'Estimate is uncertain; confirmation will be requested');
+    $('generateButton').querySelector('span').textContent = job.resume_operation?.label || (job.can_resume ? 'Resume clips' : 'Generate clips');
   }
 
   function renderSpending(job) {
@@ -147,7 +233,8 @@
     const spending = job.spending || { recorded_usd_equivalent: '0.000000', unknown_charge_count: 0, records: [], basis: 'No recorded provider usage is available.' };
     $('projectSpendingTotal').innerHTML = `${fmtMoney(spending.recorded_usd_equivalent, 6)}<small>USD equivalent</small>`;
     const unknown = Number(spending.unknown_charge_count || 0);
-    $('projectSpendingNote').textContent = `${spending.basis || 'Recorded provider usage equivalents.'}${unknown ? ` ${unknown} operation${unknown === 1 ? '' : 's'} have unknown charges.` : ''}`;
+    const limit = fmtMoney(job.project_spending_limit_usd || '6.00', 2);
+    $('projectSpendingNote').textContent = `Per-project ceiling: ${limit}. This is not permission to spend it automatically. ${spending.basis || 'Recorded provider usage equivalents.'}${unknown ? ` ${unknown} operation${unknown === 1 ? '' : 's'} have unknown charges.` : ''}`;
     const records = spending.records || [];
     $('spendingRecordCount').textContent = `${records.length} operation${records.length === 1 ? '' : 's'}`;
     const root = $('spendingRecords'); root.replaceChildren();
@@ -194,9 +281,34 @@
         : hasSourceSegment
         ? `Reference segment: ${Number(clip.source_start_seconds).toFixed(1)}–${Number(clip.source_end_seconds).toFixed(1)}s`
         : 'No exact reference segment';
-      timing.textContent = `${sourceLabel} · Target clip: ${clip.duration_seconds} seconds`;
-      row.append(number, copy, timing); shots.append(row);
+      const editLabel = Number.isFinite(clip.edit_duration_seconds) ? ` · Intended final edit: ${clip.edit_duration_seconds}s` : '';
+      timing.textContent = `${sourceLabel} · Generated clip: ${clip.duration_seconds}s${editLabel}`;
+      row.append(number, copy, timing, createAudioControls(job, clip)); shots.append(row);
     });
+  }
+
+  function createAudioControls(job, clip) {
+    const root = document.createElement('div'); root.className = 'audio-controls';
+    const label = document.createElement('label'); label.textContent = `Clip ${clip.index} audio mode`;
+    const select = document.createElement('select'); select.setAttribute('aria-label', `Clip ${clip.index} audio mode`);
+    [['auto', 'Auto · Creative Director'], ['enabled', 'Enabled · Request native audio'], ['silent', 'Silent · No audio']].forEach(([value, text]) => {
+      const option = document.createElement('option'); option.value = value; option.textContent = text; select.append(option);
+    });
+    select.value = clip.audio_mode || 'auto'; select.disabled = activeStates.has(job.status);
+    label.append(select);
+    const direction = document.createElement('small'); direction.className = 'audio-direction'; direction.setAttribute('aria-label', 'Audio direction');
+    const selection = clip.audio_mode === 'enabled' ? 'Enabled · native audio requested' : clip.audio_mode === 'silent' ? 'Silent · no native audio' : clip.audio_enabled ? 'Auto · Creative Director selected native audio' : 'Auto · Creative Director selected silent output';
+    direction.textContent = `${selection}${clip.audio_direction ? ` — ${clip.audio_direction}` : ''}`;
+    const note = document.createElement('small'); note.textContent = 'Applies to the next generation or regeneration.';
+    select.addEventListener('change', async () => {
+      select.disabled = true;
+      try {
+        const updated = await request(`/api/jobs/${job.id}/clips/${clip.index}/audio`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ mode: select.value }) });
+        renderJob(updated); toast('Clip audio setting saved.');
+      } catch (error) { toast(error.message); renderJob(job); }
+    });
+    root.append(label, direction, note);
+    return root;
   }
 
   function renderResults(job) {
@@ -216,7 +328,7 @@
       const desc = document.createElement('p'); desc.textContent = selected ? `${selected.duration_seconds}s · ${versions.length} version${versions.length === 1 ? '' : 's'}` : (clip.status || 'Waiting to generate').replaceAll('_', ' ');
       title.append(h3, desc); header.append(title);
       const tag = document.createElement('span'); tag.className = 'version-tag'; tag.textContent = selected ? `V${selected.version}` : 'PLANNED'; header.append(tag);
-      card.append(header);
+      card.append(header, createAudioControls(job, clip));
       if (selected) {
         const video = document.createElement('video'); video.className = 'clip-video'; video.controls = true; video.playsInline = true; video.preload = 'metadata'; video.src = assetUrl(selected.video);
         const assets = document.createElement('div'); assets.className = 'clip-assets';
@@ -286,7 +398,8 @@
       const copy = document.createElement('div'); copy.className = 'starting-image-copy';
       const title = document.createElement('h3'); title.textContent = `Clip ${String(clip.index).padStart(2, '0')} · ${clip.creative_role || clip.title || 'Planned shot'}`;
       const action = document.createElement('p'); action.textContent = `${clip.title && clip.title !== clip.creative_role ? `${clip.title}. ` : ''}${clip.action || 'Review the planned starting frame.'}`;
-      const imageState = document.createElement('small'); imageState.textContent = `Image ${clip.starting_image_history?.length || 1} · ${clip.duration_seconds}s planned clip`;
+      const editLabel = Number.isFinite(clip.edit_duration_seconds) ? ` · ${clip.edit_duration_seconds}s intended edit` : '';
+      const imageState = document.createElement('small'); imageState.textContent = `Image ${clip.starting_image_history?.length || 1} · ${clip.duration_seconds}s generated${editLabel}`;
       copy.append(title, action, imageState);
       const edit = document.createElement('div'); edit.className = 'starting-image-edit';
       const input = document.createElement('textarea'); input.rows = 2; input.maxLength = 1200; input.placeholder = 'Optional image adjustment, such as tool angle or hand placement…'; input.setAttribute('aria-label', `Image adjustment for clip ${clip.index}`);
@@ -296,6 +409,46 @@
         catch (error) { toast(error.message); }
       });
       edit.append(input, button); card.append(copy, edit); root.append(card);
+      const masked = document.createElement('details'); masked.className = 'masked-edit-option';
+      const summary = document.createElement('summary'); summary.textContent = 'Optional: preserve a scene with masked editing';
+      const help = document.createElement('p'); help.textContent = 'Choose a suitable saved scene image as the base. Character identity references follow the saved character groups, preferring approved anchors; provisional images are not approved automatically. The exact-source saved mask is reused when available; otherwise upload a same-size transparent PNG mask. Transparent pixels are editable and opaque pixels protect the background.';
+      const base = document.createElement('select'); base.setAttribute('aria-label', `Scene base for clip ${clip.index}`);
+      const placeholder = document.createElement('option'); placeholder.value = ''; placeholder.textContent = 'Choose a scene image'; base.append(placeholder);
+      const choices = job.scene_base_images || [];
+      for (const choice of choices) {
+        const option = document.createElement('option'); option.value = choice.value;
+        option.textContent = `${choice.label}${choice.mask_available ? ' · saved mask' : ' · mask upload needed'}`;
+        base.append(option);
+      }
+      const preview = document.createElement('img'); preview.alt = 'Selected scene base preview'; preview.hidden = true;
+      const maskFile = document.createElement('input'); maskFile.type = 'file'; maskFile.accept = 'image/png';
+      maskFile.setAttribute('aria-label', `Optional localized alpha mask for clip ${clip.index}`);
+      const maskStatus = document.createElement('small'); maskStatus.textContent = 'No scene selected. The normal regeneration option remains available above.';
+      base.addEventListener('change', () => {
+        const choice = choices.find((item) => item.value === base.value);
+        preview.hidden = !choice;
+        if (choice) preview.src = choice.url;
+        maskFile.value = '';
+        maskStatus.textContent = !choice ? 'No scene selected.' : choice.mask_available
+          ? 'A saved mask for this exact source image will be reused. Upload a replacement mask only if needed.'
+          : 'No saved mask matches this source. Upload a same-size transparent PNG to continue.';
+        maskedButton.disabled = !controlsEnabled || !choice;
+      });
+      const maskedButton = document.createElement('button'); maskedButton.type = 'button'; maskedButton.className = 'button button-secondary';
+      maskedButton.textContent = 'Generate Masked Candidate · ~$0.05'; maskedButton.disabled = !controlsEnabled || choices.length === 0;
+      maskedButton.addEventListener('click', async () => {
+        const choice = choices.find((item) => item.value === base.value);
+        if (!choice) { toast('Choose an appropriate scene image first.'); return; }
+        const file = maskFile.files?.[0];
+        if (!choice.mask_available && !file) { toast('Upload a transparent PNG mask for this scene image.'); return; }
+        const form = new FormData(); form.set('edit_mode', 'masked'); form.set('base_source', choice.value);
+        form.set('instructions', input.value.trim());
+        if (file) form.set('mask_image', file, file.name);
+        try { await performPaidAction(`/api/jobs/${job.id}/clips/${clip.index}/starting-image/regenerate`, form, `Clip ${clip.index} masked image edit`); }
+        catch (error) { toast(error.message); }
+      });
+      masked.append(summary, help, base, preview, maskFile, maskStatus, maskedButton);
+      card.append(masked);
     });
     approve = $('approveImagesButton');
     approve.hidden = job.status !== 'awaiting_image_review';
@@ -303,10 +456,44 @@
     syncApproval();
   }
 
+  function updateCreationModeUi() {
+    const original = $('creationMode').value === 'original';
+    $('referenceHeading').closest('.input-panel').hidden = original;
+    $('hookField').hidden = false;
+    $('analyzeButton').textContent = original ? 'Develop original concept' : 'Analyze reference';
+    $('instructions').placeholder = original ? 'Describe your original idea and product. Include anything you already know; the Creative Director will ask what it needs…' : 'Use this video’s creative structure, but feature my product…';
+  }
+
+  function restoreSelectValue(select, value, label) {
+    const saved = String(value);
+    if (![...select.options].some((option) => option.value === saved)) {
+      const option = document.createElement('option'); option.value = saved; option.textContent = label; select.append(option);
+    }
+    select.value = saved;
+  }
+
   function renderJob(job) {
     state.job = job;
+    try { localStorage.setItem('ecomVideoCurrentJobId', job.id); } catch (_) {}
+    restoreSelectValue($('creationMode'), job.mode || 'reference', job.mode || 'Reference Recreation');
+    restoreSelectValue($('hookType'), job.hook || 'recommend', job.hook || 'Recommend a hook');
+    const countValue = job.clip_count_selection === 'director' ? 'director' : String(job.requested_clip_count || 3);
+    const durationValue = job.duration_selection === 'director' ? 'director' : String(job.seconds_per_clip || 5);
+    restoreSelectValue($('clipCount'), countValue, countValue === 'director' ? 'Director decides' : `${countValue} clips`);
+    restoreSelectValue($('clipSeconds'), durationValue, durationValue === 'director' ? 'Director decides' : `${durationValue} sec`);
+    $('instructions').value = job.instructions || '';
+    $('characterCount').textContent = `${$('instructions').value.length.toLocaleString()} / ${MAX_INSTRUCTION_LENGTH.toLocaleString()}`;
     $('reviewImagesBeforeVideo').checked = Boolean(job.review_images_before_video || job.status === 'awaiting_image_review');
+    const reference = (job.inputs || []).find((asset) => asset.role === 'reference_video');
+    state.productFiles = [];
+    state.savedProductAssets = (job.inputs || []).filter((asset) => asset.role === 'product_reference');
+    setSavedVideo(reference || null);
+    renderImages();
+    updateCreationModeUi();
     $('topbarTitle').textContent = job.title || 'Current creation';
+    $('currentProjectStorage').textContent = `${formatBytes(job.storage_bytes || 0)} on disk`;
+    $('currentProjectStorage').hidden = false;
+    $('deleteCurrentProject').hidden = false;
     $('analysisHeading').textContent = job.mode === 'original' ? 'Creative Plan' : 'Reference analysis';
     updateProgress(job); updateEstimate(job); renderSpending(job); renderAnalysis(job); renderResults(job); renderImageReview(job);
     const interview = $('interviewSection');
@@ -334,15 +521,20 @@
   async function refreshHistory() {
     try {
       const response = await request('/api/jobs');
+      state.historyJobs = response.jobs;
+      state.selectedProjectIds = new Set([...state.selectedProjectIds].filter((id) => response.jobs.some((job) => job.id === id)));
+      $('storageSummary').textContent = `Managed storage: ${formatBytes(response.storage?.total_bytes || 0)} · ${response.storage?.project_count || 0} projects`;
       const root = $('historyList'); root.replaceChildren();
-      if (!response.jobs.length) { const p = document.createElement('p'); p.className = 'history-empty'; p.textContent = 'Your recent projects will appear here.'; root.append(p); return; }
+      if (!response.jobs.length) { const p = document.createElement('p'); p.className = 'history-empty'; p.textContent = 'Your recent projects will appear here.'; root.append(p); updateBulkControls(); return; }
       response.jobs.forEach((job) => {
         const name = job.title || 'Project';
         const row = document.createElement('div'); row.className = 'history-row';
+        const select = document.createElement('input'); select.type = 'checkbox'; select.className = 'history-select'; select.checked = state.selectedProjectIds.has(job.id); select.disabled = activeStates.has(job.status); select.setAttribute('aria-label', `Select ${name}`);
+        select.addEventListener('change', () => { select.checked ? state.selectedProjectIds.add(job.id) : state.selectedProjectIds.delete(job.id); updateBulkControls(); });
         const button = document.createElement('button'); button.className = `history-item${state.job?.id === job.id ? ' selected' : ''}`; button.type = 'button';
         button.title = name;
         const nameLabel = document.createElement('span'); nameLabel.className = 'history-name'; nameLabel.textContent = name;
-        const meta = document.createElement('small'); meta.textContent = `${titles[job.status] || job.status} · ${new Date(job.updated_at).toLocaleDateString()}`;
+        const meta = document.createElement('small'); meta.textContent = `${titles[job.status] || job.status} · ${formatBytes(job.storage_bytes || 0)} · ${new Date(job.updated_at).toLocaleDateString()}`;
         button.append(nameLabel, meta); button.addEventListener('click', async () => { try { renderJob(await request(`/api/jobs/${job.id}`)); await refreshHistory(); } catch (error) { toast(error.message); } });
         const edit = document.createElement('button'); edit.className = 'history-rename'; edit.type = 'button';
         edit.setAttribute('aria-label', `Rename ${name}`); edit.title = `Rename ${name}`;
@@ -397,17 +589,62 @@
         remove.addEventListener('click', (event) => {
           event.stopPropagation();
           state.pendingDeleteProjectId = job.id;
-          $('deleteProjectName').textContent = name;
-          $('confirmDeleteProject').disabled = false;
-          $('deleteProjectDialog').showModal();
+          openDeleteConfirmation([job.id], name);
         });
-        row.append(button, edit, remove); root.append(row);
+        row.append(select, button, edit, remove); root.append(row);
       });
+      updateBulkControls();
+      if (!state.job) {
+        let currentId = null;
+        try { currentId = localStorage.getItem('ecomVideoCurrentJobId'); } catch (_) {}
+        if (currentId === 'new') return;
+        if (!currentId) currentId = response.jobs[0]?.id || null;
+        if (currentId && response.jobs.some((job) => job.id === currentId)) {
+          renderJob(await request(`/api/jobs/${currentId}`));
+          await refreshHistory();
+        } else if (currentId) {
+          try { localStorage.removeItem('ecomVideoCurrentJobId'); } catch (_) {}
+        }
+      }
     } catch (_) { /* The workspace remains usable when history cannot be read. */ }
   }
 
+  function formatBytes(value) {
+    const bytes = Math.max(0, Number(value) || 0);
+    if (bytes < 1024) return `${bytes} B`;
+    const units = ['KB', 'MB', 'GB', 'TB']; let size = bytes / 1024; let unit = units[0];
+    for (let i = 1; size >= 1024 && i < units.length; i++) { size /= 1024; unit = units[i]; }
+    return `${size.toFixed(size >= 100 ? 0 : 1)} ${unit}`;
+  }
+
+  function updateBulkControls() {
+    const count = state.selectedProjectIds.size;
+    $('deleteSelectedProjects').disabled = count === 0;
+    $('deleteSelectedProjects').textContent = count ? `Delete selected (${count})` : 'Delete selected';
+  }
+
+  async function openDeleteConfirmation(ids, label) {
+    try {
+      const estimate = await request('/api/jobs/delete-estimate', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ job_ids: ids }) });
+      state.pendingDeleteProjectIds = ids;
+      state.pendingDeleteProjectId = ids.length === 1 ? ids[0] : null;
+      $('deleteProjectName').textContent = label;
+      $('deleteEstimate').textContent = `${estimate.project_count} project${estimate.project_count === 1 ? '' : 's'} · approximately ${formatBytes(estimate.recoverable_bytes)} recoverable`;
+      $('confirmDeleteProject').textContent = ids.length === 1 ? 'Delete Project' : `Delete ${estimate.project_count} Projects`;
+      $('confirmDeleteProject').disabled = false;
+      $('deleteProjectDialog').showModal();
+    } catch (error) { toast(error.message); }
+  }
+
   async function performPaidAction(url, body, label) {
-    const submit = async (approved) => request(url, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ ...body, ...(approved !== undefined ? { approved_max_usd: approved } : {}) }) });
+    const submit = async (approved) => {
+      if (body instanceof FormData) {
+        const form = new FormData(); for (const [key, value] of body.entries()) form.append(key, value);
+        if (approved !== undefined) form.set('approved_max_usd', approved);
+        return request(url, { method: 'POST', body: form });
+      }
+      return request(url, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ ...body, ...(approved !== undefined ? { approved_max_usd: approved } : {}) }) });
+    };
     try {
       renderJob(await submit()); toast(`${label} started.`); await refreshHistory();
     } catch (error) {
@@ -427,7 +664,7 @@
 
   $('videoDrop').addEventListener('click', () => $('videoInput').click());
   $('videoInput').addEventListener('change', (event) => useVideoFiles(event.target.files));
-  $('removeVideo').addEventListener('click', () => setLocalVideo(null));
+  $('removeVideo').addEventListener('click', () => { state.removeReferenceVideo = Boolean(state.savedVideo || state.videoFile); setLocalVideo(null); state.savedVideo = null; scheduleDraftSave(true); });
   $('imageDrop').addEventListener('click', () => $('productInput').click());
   $('productInput').addEventListener('change', (event) => useImageFiles(event.target.files));
   [['videoDrop', useVideoFiles], ['imageDrop', useImageFiles]].forEach(([id, handler]) => {
@@ -436,30 +673,37 @@
     zone.addEventListener('dragleave', () => zone.classList.remove('dragging'));
     zone.addEventListener('drop', (event) => { event.preventDefault(); zone.classList.remove('dragging'); handler(event.dataTransfer.files); });
   });
-  $('instructions').addEventListener('input', () => { $('characterCount').textContent = `${$('instructions').value.length.toLocaleString()} / ${MAX_INSTRUCTION_LENGTH.toLocaleString()}`; });
-  $('creationMode').addEventListener('change', () => {
-    const original = $('creationMode').value === 'original';
-    $('referenceHeading').closest('.input-panel').hidden = original;
-    $('hookField').hidden = !original;
-    $('analyzeButton').textContent = original ? 'Develop original concept' : 'Analyze reference';
-    $('instructions').placeholder = original ? 'Describe your original idea and product. Include anything you already know; the Creative Director will ask what it needs…' : 'Use this video’s creative structure, but feature my product…';
+  $('instructions').addEventListener('input', () => { $('characterCount').textContent = `${$('instructions').value.length.toLocaleString()} / ${MAX_INSTRUCTION_LENGTH.toLocaleString()}`; scheduleDraftSave(); });
+  $('creationMode').addEventListener('change', () => { updateCreationModeUi(); scheduleDraftSave(); });
+  ['hookType', 'clipCount', 'clipSeconds'].forEach((id) => $(id).addEventListener('change', () => scheduleDraftSave()));
+  $('reviewImagesBeforeVideo').addEventListener('change', async () => {
+    if (!state.job) return;
+    const checkbox = $('reviewImagesBeforeVideo');
+    const enabled = checkbox.checked;
+    if (state.job.status === 'draft') { scheduleDraftSave(); return; }
+    checkbox.disabled = true;
+    try {
+      renderJob(await request(`/api/jobs/${state.job.id}/review-images`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ enabled })
+      }));
+      await refreshHistory();
+    } catch (error) {
+      checkbox.checked = Boolean(state.job.review_images_before_video);
+      toast(error.message);
+    } finally {
+      setBusy(activeStates.has(state.job?.status));
+    }
   });
   $('creationForm').addEventListener('submit', async (event) => {
     event.preventDefault(); setError('');
     const original = $('creationMode').value === 'original';
-    if (!original && !state.videoFile) { setError('Choose a reference video to continue.'); $('videoDrop').focus(); return; }
+    if (!original && !state.videoFile && !state.savedVideo) { setError('Choose a reference video to continue.'); $('videoDrop').focus(); return; }
     if (!$('instructions').value.trim()) { setError('Add creative instructions before analyzing.'); $('instructions').focus(); return; }
     if ($('instructions').value.length > MAX_INSTRUCTION_LENGTH) { setError('Keep creative instructions to 20,000 characters or fewer.'); return; }
-    const form = new FormData();
-    if (state.videoFile) form.append('reference_video', state.videoFile, state.videoFile.name);
-    state.productFiles.forEach((file) => form.append('product_images', file, file.name));
-    form.append('instructions', $('instructions').value);
-    form.append('mode', original ? 'original' : 'reference'); form.append('hook', $('hookType').value);
-    form.append('clip_count', $('clipCount').value); form.append('seconds_per_clip', $('clipSeconds').value);
-    form.append('review_images_before_video', String($('reviewImagesBeforeVideo').checked));
     try {
-      setBusy(true); $('jobStatusTitle').textContent = original ? 'Starting interview' : 'Submitting analysis'; $('jobStatusMessage').textContent = original ? 'The Creative Director is reviewing your idea.' : 'The selected reference is being prepared for analysis.';
-      renderJob(await request('/api/jobs', { method: 'POST', body: form }));
+      setBusy(true); $('jobStatusTitle').textContent = 'Saving project'; $('jobStatusMessage').textContent = 'Saving your inputs before analysis.';
+      if (!state.job || state.job.status === 'draft') await saveDraft();
+      renderJob(await request(`/api/jobs/${state.job.id}/analyze`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' }));
       await refreshHistory();
     } catch (error) { setBusy(false); setError(error.message); $('jobStatusTitle').textContent = 'Waiting for a reference'; $('jobStatusMessage').textContent = 'Choose a video to begin.'; }
   });
@@ -490,37 +734,53 @@
   $('approveImagesButton').addEventListener('click', async () => {
     if (!state.job) return;
     const button = $('approveImagesButton'); button.disabled = true;
-    try { renderJob(await request(`/api/jobs/${state.job.id}/approve-images`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' })); toast('Images approved. Video generation started.'); await refreshHistory(); }
-    catch (error) { toast(error.message); button.disabled = false; }
+    try { await performPaidAction(`/api/jobs/${state.job.id}/approve-images`, {}, 'Video generation'); }
+    catch (error) { toast(error.message); }
+    finally { button.disabled = false; }
   });
   $('confirmApproval').addEventListener('click', async () => { if (state.pendingAction) { try { await state.pendingAction(); } catch (error) { toast(error.message); } } });
   $('cancelApproval').addEventListener('click', () => { state.pendingAction = null; $('approvalDialog').close(); });
   $('cancelDeleteProject').addEventListener('click', () => $('deleteProjectDialog').close());
-  $('deleteProjectDialog').addEventListener('close', () => { state.pendingDeleteProjectId = null; $('confirmDeleteProject').disabled = false; });
+  $('deleteProjectDialog').addEventListener('close', () => { state.pendingDeleteProjectId = null; state.pendingDeleteProjectIds = []; $('confirmDeleteProject').disabled = false; $('confirmDeleteProject').textContent = 'Delete Project'; });
   $('confirmDeleteProject').addEventListener('click', async () => {
-    const projectId = state.pendingDeleteProjectId;
-    if (!projectId) return;
-    const wasOpen = state.job?.id === projectId;
+    const projectIds = state.pendingDeleteProjectIds;
+    if (!projectIds.length) return;
+    const wasOpen = projectIds.includes(state.job?.id);
     const confirmButton = $('confirmDeleteProject');
     confirmButton.disabled = true;
     try {
-      await request(`/api/jobs/${projectId}/delete`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' });
+      if (projectIds.length === 1) await request(`/api/jobs/${projectIds[0]}/delete`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' });
+      else await request('/api/jobs/delete-bulk', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ job_ids: projectIds }) });
+      projectIds.forEach((id) => state.selectedProjectIds.delete(id));
       $('deleteProjectDialog').close();
       if (wasOpen) $('newProject').click();
       await refreshHistory();
-      toast('Project deleted.');
+      toast(projectIds.length === 1 ? 'Project deleted.' : `${projectIds.length} projects deleted.`);
     } catch (error) {
       confirmButton.disabled = false;
       toast(error.message);
     }
   });
+  $('selectCompletedProjects').addEventListener('click', () => {
+    state.historyJobs.filter((job) => job.status === 'completed').forEach((job) => state.selectedProjectIds.add(job.id));
+    refreshHistory();
+  });
+  $('deleteSelectedProjects').addEventListener('click', () => {
+    const ids = [...state.selectedProjectIds];
+    if (ids.length) openDeleteConfirmation(ids, `${ids.length} selected projects`);
+  });
+  $('deleteCurrentProject').addEventListener('click', () => {
+    if (state.job) openDeleteConfirmation([state.job.id], state.job.title || 'Project');
+  });
   $('newProject').addEventListener('click', () => {
     clearTimeout(state.pollTimer); state.job = null; state.pendingAction = null;
+    try { localStorage.setItem('ecomVideoCurrentJobId', 'new'); } catch (_) {}
+    state.savedVideo = null; state.savedProductAssets = []; state.removeReferenceVideo = false;
     $('creationForm').reset(); $('characterCount').textContent = `0 / ${MAX_INSTRUCTION_LENGTH.toLocaleString()}`; setLocalVideo(null); state.productFiles = []; renderImages();
-    $('reviewImagesBeforeVideo').checked = false;
+    $('reviewImagesBeforeVideo').checked = DEFAULT_REVIEW_IMAGES_BEFORE_VIDEO;
     $('analysisSection').hidden = true; $('imageReviewSection').hidden = true; $('startingImageReview').replaceChildren(); $('resultsSection').hidden = true; $('clipResults').replaceChildren(); setError('');
-    $('topbarTitle').textContent = 'New creation'; $('jobStatusTitle').textContent = 'Waiting for a reference'; $('jobStatusMessage').textContent = 'Choose a video to begin.';
-    $('statusLamp').className = 'status-lamp'; $('generateButton').disabled = true; updateEstimate({}); renderSpending(null); window.scrollTo({ top: 0, behavior: 'smooth' });
+    $('topbarTitle').textContent = 'New creation'; $('currentProjectStorage').hidden = true; $('deleteCurrentProject').hidden = true; $('jobStatusTitle').textContent = 'Waiting for a reference'; $('jobStatusMessage').textContent = 'Choose a video to begin.';
+    $('statusLamp').className = 'status-lamp'; $('generateButton').disabled = true; updateEstimate({}); renderSpending(null); updateCreationModeUi(); window.scrollTo({ top: 0, behavior: 'smooth' });
     setBusy(false);
   });
 

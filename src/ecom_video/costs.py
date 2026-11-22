@@ -1,13 +1,28 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from decimal import Decimal, ROUND_CEILING
+from decimal import Decimal, ROUND_CEILING, ROUND_HALF_UP
 
 
 IMAGE_1K_USD = Decimal("0.03")
+MASKED_EDIT_1K_USD = Decimal("0.05")
 VIDEO_720P_PER_SECOND_USD = Decimal("0.0225")
 ANALYSIS_ALLOWANCE_USD = Decimal("0.02")
 KIE_USD_PER_CREDIT = Decimal("0.005")
+DEFAULT_PROJECT_SPENDING_LIMIT_USD = Decimal("6.00")
+ESTIMATE_DISPLAY_QUANTUM_USD = Decimal("0.0001")
+
+
+def estimate_within_approved_amount(estimate: Decimal, approved: Decimal) -> bool:
+    """Compare at the four-decimal precision shown in generation confirmations."""
+    shown_estimate = estimate.quantize(ESTIMATE_DISPLAY_QUANTUM_USD, rounding=ROUND_HALF_UP)
+    shown_approval = approved.quantize(ESTIMATE_DISPLAY_QUANTUM_USD, rounding=ROUND_HALF_UP)
+    return shown_estimate <= shown_approval
+
+
+def reserve_estimate_usd(estimate: Decimal) -> Decimal:
+    """Round estimated spend upward to display precision before checking a project cap."""
+    return estimate.quantize(ESTIMATE_DISPLAY_QUANTUM_USD, rounding=ROUND_CEILING)
 
 
 @dataclass(frozen=True)

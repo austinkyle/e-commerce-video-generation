@@ -7,7 +7,7 @@ from decimal import Decimal
 from pathlib import Path
 
 from ecom_video.config import load_config
-from ecom_video.costs import estimate_generation, price_openai_analysis_usage
+from ecom_video.costs import estimate_generation, estimate_within_approved_amount, price_openai_analysis_usage
 from ecom_video.media import probe_video, sample_frames
 from ecom_video.models import AnalysisResult
 from ecom_video.workflow import (
@@ -108,7 +108,7 @@ def _generate_multiclip(args: argparse.Namespace) -> None:
         return
     pricing_verified = not args.require_approval
     estimate_reliable = not args.require_approval
-    if args.approve_max_usd is not None and args.approve_max_usd < estimate.total_usd:
+    if args.approve_max_usd is not None and not estimate_within_approved_amount(estimate.total_usd, args.approve_max_usd):
         raise PermissionError(
             f"Estimated cost ${estimate.total_usd:.4f} exceeds approved maximum ${args.approve_max_usd:.4f}"
         )
@@ -201,7 +201,7 @@ def main() -> None:
     generate = commands.add_parser("generate-clips", help="Generate separate clips from a saved plan")
     generate.add_argument("--plan", required=True)
     generate.add_argument("--output-dir", default="data/outputs/multiclip-run")
-    generate.add_argument("--approve-max-usd", type=Decimal, help="Explicit maximum for jobs over $1.00 or with uncertain pricing")
+    generate.add_argument("--approve-max-usd", type=Decimal, help="Explicit maximum for jobs over $0.50 or with uncertain pricing")
     generate.add_argument("--require-approval", action="store_true", help="Hold for confirmation when pricing or the estimate is uncertain")
     generate.add_argument("--dry-run", action="store_true", help="Show estimate and stop without paid calls")
     generate.set_defaults(run=_generate_multiclip)

@@ -15,6 +15,7 @@ API = "https://api.kie.ai"
 UPLOAD_API = "https://kieai.redpandaai.co"
 VIDEO_MODEL = "grok-imagine-video-1-5-preview"
 IMAGE_MODEL = "gpt-image-2-5-sunburst-image-to-image"
+MASKED_EDIT_MODEL = "gpt-image-2-6/sunburst-image-to-image"
 
 
 class KieTaskFailed(RuntimeError):
@@ -23,7 +24,10 @@ class KieTaskFailed(RuntimeError):
     def __init__(self, task_id: str, task_data: dict[str, Any]):
         self.task_id = task_id
         self.task_data = task_data
-        super().__init__(f"Kie task failed: {task_data.get('failMsg') or task_data.get('failCode') or 'unknown error'}")
+        details = task_data.get("failMsg") or "unknown error"
+        code = task_data.get("failCode")
+        code_text = f" (code {code})" if code not in (None, "") else ""
+        super().__init__(f"Kie task {task_id} failed{code_text}: {details}")
 
 
 class KieTaskSubmissionUnknown(RuntimeError):
@@ -62,6 +66,28 @@ class KieClient:
                                                "aspect_ratio": aspect_ratio, "resolution": "1K",
                                                "background": "opaque"})
 
+    def create_masked_image_edit(self, prompt: str, input_urls: list[str], mask_url: str,
+                                 aspect_ratio: str = "9:16") -> str:
+        """Submit an explicitly requested, masked GPT Image 2.6 Sunburst edit.
+
+        This separate method intentionally leaves the default 2.5 generation
+        path untouched. Kie's endpoint applies ``mask_url`` to the first input.
+        """
+        if not input_urls or len(input_urls) > 16:
+            raise ValueError("Masked image editing requires 1 to 16 reference images")
+        if not mask_url.startswith("https://"):
+            raise ValueError("Masked image editing requires an HTTPS mask URL")
+        return self._create_task(MASKED_EDIT_MODEL, {
+            "prompt": prompt,
+            "input_urls": input_urls,
+            "mask_url": mask_url,
+            "aspect_ratio": aspect_ratio,
+            "resolution": "1K",
+            "quality": "medium",
+            "output_format": "png",
+            "background": "opaque",
+        })
+
     def create_text_image(self, prompt: str, aspect_ratio: str = "9:16") -> str:
         return self._create_task("gpt-image-2-5-sunburst-text-to-image", {
             "prompt": prompt, "aspect_ratio": aspect_ratio,
@@ -71,7 +97,9 @@ class KieClient:
     def create_video(self, prompt: str, image_url: str, duration_seconds: int,
                      first_frame_url: str | None = None, last_frame_url: str | None = None,
                      keyframes: list[dict[str, Any]] | None = None,
-                     aspect_ratio: str = "9:16", resolution: str = "720p") -> str:
+                     reference_image_urls: list[str] | None = None,
+                     aspect_ratio: str = "9:16", resolution: str = "720p",
+                     enable_audio: bool | None = False) -> str:
         prompt_length = kie_video_prompt_length(prompt)
         if prompt_length > KIE_VIDEO_PROMPT_MAX_CHARACTERS:
             raise ValueError(
@@ -84,9 +112,15 @@ class KieClient:
             raise ValueError("Unsupported Grok preview resolution")
         if keyframes and len(keyframes) > 4:
             raise ValueError("Grok preview accepts at most four intermediate keyframes")
-        inputs: dict[str, Any] = {"prompt": prompt, "image_urls": [image_url], "duration": duration_seconds,
-                                  "resolution": resolution, "aspect_ratio": aspect_ratio,
-                                  "enable_audio": False}
+        reference_image_urls = list(reference_image_urls or [])
+        if len(reference_image_urls) > 6 or image_url in reference_image_urls or len(set(reference_image_urls)) != len(reference_image_urls):
+            raise ValueError("Grok preview accepts at most 7 total images: the starting frame and six additional, distinct references")
+        if reference_image_urls and resolution == "1080p":
+            raise ValueError("Grok preview supports only one image reference at 1080p")
+        inputs: dict[str, Any] = {"prompt": prompt, "image_urls": [image_url, *reference_image_urls], "duration": duration_seconds,
+                                  "resolution": resolution, "aspect_ratio": aspect_ratio}
+        if enable_audio is not None:
+            inputs["enable_audio"] = enable_audio
         if first_frame_url:
             inputs["first_frame_url"] = first_frame_url
         if last_frame_url:

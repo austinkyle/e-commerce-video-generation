@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import mimetypes
 import os
 import re
@@ -16,34 +17,46 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Callable
 from urllib.parse import parse_qs, quote, unquote, urlsplit
+import struct
 
 from ecom_video.costs import (
     ANALYSIS_ALLOWANCE_USD,
+    DEFAULT_PROJECT_SPENDING_LIMIT_USD,
     IMAGE_1K_USD,
+    MASKED_EDIT_1K_USD,
     KIE_USD_PER_CREDIT,
     price_openai_analysis_usage,
+    estimate_within_approved_amount,
+    reserve_estimate_usd,
 )
 from ecom_video.media import probe_video, sample_frames
-from ecom_video.models import AnalysisResult
+from ecom_video.models import AnalysisResult, AudioMode
 from ecom_video.providers.kie import KieClient
 from ecom_video.providers.openai import analyze_reference, direct_original, revise_creative_plan
 from ecom_video.workflow import (
+    AUTO_GENERATION_APPROVAL_LIMIT_USD,
     MultiClipPlan,
     MAX_CREATIVE_INSTRUCTIONS,
     PlannedClip,
     build_multiclip_plan,
     creative_instruction_length,
     estimate_multiclip_generation,
+    fit_reference_analysis_to_clip_count,
     generation_approval_required,
     normalize_reference_segments,
     product_identity_clip_index,
     run_multiclip_generation,
+    find_saved_mask_for_scene,
+    run_masked_image_edit,
+    starting_image_revision_prompt,
 )
 
 MAX_UPLOAD_BYTES = 200 * 1024 * 1024
 MAX_PRODUCT_IMAGES = 16
 MAX_PRODUCT_IMAGE_BYTES = 20 * 1024 * 1024
+MAX_MASK_IMAGE_BYTES = 20 * 1024 * 1024
 MAX_PROJECT_TITLE_LENGTH = 100
+DEFAULT_REVIEW_IMAGES_BEFORE_VIDEO = True
 MAX_REQUEST_BYTES = MAX_UPLOAD_BYTES + MAX_PRODUCT_IMAGES * MAX_PRODUCT_IMAGE_BYTES + 1024 * 1024
 ACTIVE_STATUSES = {"queued", "analyzing_reference", "refining_plan", "preparing_images", "generating_clips", "processing_outputs", "regenerating", "regenerating_starting_image"}
 DELETION_BLOCKED_STATUSES = ACTIVE_STATUSES | {"interviewing"}
@@ -86,6 +99,54 @@ def _image_extension(data: bytes) -> str | None:
     if len(data) >= 12 and data[:4] == b"RIFF" and data[8:12] == b"WEBP":
         return ".webp"
     return None
+
+
+def _image_dimensions(path: Path) -> tuple[int, int] | None:
+    """Read PNG/JPEG dimensions without adding an image-processing dependency."""
+    try:
+        data = path.read_bytes()
+    except OSError:
+        return None
+    if data.startswith(b"\x89PNG\r\n\x1a\n") and len(data) >= 26:
+        return struct.unpack(">II", data[16:24])
+    if not data.startswith(b"\xff\xd8"):
+        return None
+    offset = 2
+    while offset + 4 <= len(data):
+        if data[offset] != 0xFF:
+            offset += 1
+            continue
+        marker = data[offset + 1]
+        offset += 2
+        if marker in {0xD8, 0xD9} or 0xD0 <= marker <= 0xD7:
+            continue
+        if offset + 2 > len(data):
+            break
+        length = int.from_bytes(data[offset:offset + 2], "big")
+        if length < 2 or offset + length > len(data):
+            break
+        if marker in {0xC0, 0xC1, 0xC2, 0xC3, 0xC5, 0xC6, 0xC7, 0xC9, 0xCA, 0xCB, 0xCD, 0xCE, 0xCF}:
+            if length < 7:
+                break
+            height = int.from_bytes(data[offset + 3:offset + 5], "big")
+            width = int.from_bytes(data[offset + 5:offset + 7], "big")
+            return width, height
+        offset += length
+    return None
+
+
+def _validate_mask_png(mask_path: Path, source_path: Path) -> tuple[int, int]:
+    try:
+        header = mask_path.read_bytes()[:29]
+    except OSError as exc:
+        raise AppError("The selected mask file could not be read.") from exc
+    if (len(header) < 29 or header[:8] != b"\x89PNG\r\n\x1a\n"
+            or header[12:16] != b"IHDR" or header[25] not in {4, 6}):
+        raise AppError("Use a transparent PNG mask (grayscale-alpha or RGBA). Transparent pixels are edited; opaque pixels are protected.")
+    dimensions = struct.unpack(">II", header[16:24])
+    if dimensions != _image_dimensions(source_path):
+        raise AppError("The mask dimensions must exactly match the selected scene image.")
+    return dimensions
 
 
 def _credit_value(task: dict) -> Decimal:
@@ -150,6 +211,7 @@ class LocalJobService:
         self.lock = threading.RLock()
         self.workers: set[threading.Thread] = set()
         self._mark_interrupted_jobs()
+        self.cleanup_temporary_files()
 
     def _job_path(self, job_id: str) -> Path:
         if not re.fullmatch(r"[0-9a-f-]{36}", job_id):
@@ -262,6 +324,167 @@ class LocalJobService:
             self.workers.add(thread)
         thread.start()
 
+    @staticmethod
+    def _draft_selection(fields: dict[str, str]) -> tuple[str, str, int, int]:
+        count_choice = fields.get("clip_count", "3") or "3"
+        duration_choice = fields.get("seconds_per_clip", "5") or "5"
+        count_mode = "director" if count_choice == "director" else "fixed"
+        duration_mode = "director" if duration_choice == "director" else "fixed"
+        try:
+            clip_count = 12 if count_mode == "director" else int(count_choice)
+            seconds = 5 if duration_mode == "director" else int(duration_choice)
+        except ValueError:
+            raise AppError("Choose valid clip count and duration settings.") from None
+        if not 1 <= clip_count <= 12 or not 1 <= seconds <= 15:
+            raise AppError("Choose 1–12 clips and 1–15 seconds per clip.")
+        return count_mode, duration_mode, clip_count, seconds
+
+    def save_draft(
+        self,
+        fields: dict[str, str],
+        files: dict[str, list[tuple[str, bytes]]],
+        job_id: str | None = None,
+    ) -> dict:
+        """Persist an editable workspace without starting any paid work."""
+        mode = fields.get("mode", "reference")
+        hook = fields.get("hook", "recommend")
+        if mode not in {"reference", "original"}:
+            raise AppError("Choose Reference Recreation or Original Concept.")
+        if hook not in {"recommend", "in_store_reaction", "wet_works", "countdown_reveal", "gifting", "versus", "custom"}:
+            raise AppError("Choose a supported creative hook.")
+        instructions = fields.get("instructions", "")
+        if creative_instruction_length(instructions) > MAX_CREATIVE_INSTRUCTIONS:
+            raise AppError("Keep creative instructions to 20,000 characters or fewer.")
+        count_mode, duration_mode, clip_count, seconds = self._draft_selection(fields)
+        review = fields.get("review_images_before_video", "true").lower() in {"1", "true", "on"}
+        video_files = files.get("reference_video", [])
+        product_files = files.get("product_images", [])
+        if len(video_files) > 1:
+            raise AppError("Choose one reference video.")
+        validated_images: list[tuple[str, bytes, str]] = []
+        for name, content in product_files:
+            extension = _image_extension(content)
+            if not extension or len(content) > MAX_PRODUCT_IMAGE_BYTES:
+                raise AppError("Each product image must be a supported JPEG, PNG, or WebP image up to 20 MB.")
+            validated_images.append((Path(name).name, content, extension))
+        if len(validated_images) > MAX_PRODUCT_IMAGES:
+            raise AppError(f"Upload no more than {MAX_PRODUCT_IMAGES} product images.")
+
+        with self.lock:
+            if job_id:
+                job = self._read(job_id)
+                if job.get("status") != "draft":
+                    raise JobConflict("Only an unanalyzed draft can be edited from the creation form.")
+            else:
+                job_id = str(uuid.uuid4())
+                job = {
+                    "id": job_id, "title": "New creation", "mode": mode, "hook": hook,
+                    "project_spending_limit_usd": str(DEFAULT_PROJECT_SPENDING_LIMIT_USD),
+                    "status": "draft", "stage": "draft", "message": "Draft saved locally.",
+                    "provider_state": None, "created_at": _now(), "updated_at": _now(),
+                    "reference_video": None, "reference_video_info": {}, "reference_asset_id": None,
+                    "product_references": [], "product_asset_ids": [], "instructions": "",
+                    "requested_clip_count": 3, "clip_count_selection": "fixed", "seconds_per_clip": 5,
+                    "duration_selection": "fixed", "review_images_before_video": DEFAULT_REVIEW_IMAGES_BEFORE_VIDEO,
+                    "assets": {}, "analysis": None, "plan_json": None, "estimate": None,
+                    "estimate_reliable": True, "clips": [],
+                    "charges": {"analysis_usd": "0", "kie_credits": "0", "kie_usd_equivalent": "0", "total_usd": "0", "entries": []},
+                    "error": None,
+                }
+                (self._job_path(job_id).parent / "inputs").mkdir(parents=True, exist_ok=True)
+
+            job.update(
+                mode=mode, hook=hook, instructions=instructions,
+                requested_clip_count=clip_count, clip_count_selection=count_mode,
+                seconds_per_clip=seconds, duration_selection=duration_mode,
+                review_images_before_video=review,
+                title=_default_project_title(mode, instructions, Path(video_files[0][0]).name if video_files else None),
+            )
+
+            retained_raw = fields.get("product_asset_ids")
+            if retained_raw is not None:
+                try:
+                    retained_ids = json.loads(retained_raw)
+                except (TypeError, json.JSONDecodeError):
+                    raise AppError("The saved product image selection is invalid.") from None
+                if not isinstance(retained_ids, list) or any(not isinstance(item, str) for item in retained_ids):
+                    raise AppError("The saved product image selection is invalid.")
+                for asset_id in retained_ids:
+                    asset = job["assets"].get(asset_id)
+                    if not asset or asset.get("role") != "product_reference" or not Path(asset["path"]).is_file():
+                        raise AppError("A saved product image is no longer available. Choose it again to continue.")
+                product_asset_ids = list(dict.fromkeys(retained_ids))
+            else:
+                product_asset_ids = list(job.get("product_asset_ids", []))
+            if len(product_asset_ids) + len(validated_images) > MAX_PRODUCT_IMAGES:
+                raise AppError(f"Upload no more than {MAX_PRODUCT_IMAGES} product images.")
+
+            if video_files:
+                name, content = video_files[0]
+                suffix = Path(name).suffix.lower()
+                if suffix not in {".mp4", ".mov"} or not content or len(content) > MAX_UPLOAD_BYTES:
+                    raise AppError("Choose a readable MP4 or MOV reference video up to 200 MB.")
+                input_dir = self._job_path(job_id).parent / "inputs"
+                version = 1
+                while True:
+                    candidate = input_dir / (f"reference{suffix}" if version == 1 else f"reference-{version:02d}{suffix}")
+                    if not candidate.exists():
+                        break
+                    version += 1
+                candidate.write_bytes(content)
+                try:
+                    video_info = self.video_probe(candidate)
+                except Exception:
+                    candidate.unlink(missing_ok=True)
+                    raise AppError("The selected file could not be read as a video. Check that it opens and try again.") from None
+                job["reference_video"] = str(candidate)
+                job["reference_video_info"] = video_info
+                job["reference_asset_id"] = self._add_asset(job, candidate, Path(name).name, "video", "reference_video")
+            elif fields.get("remove_reference_video", "false").lower() in {"1", "true", "on"}:
+                job["reference_video"] = None
+                job["reference_video_info"] = {}
+                job["reference_asset_id"] = None
+
+            input_dir = self._job_path(job_id).parent / "inputs"
+            for name, content, extension in validated_images:
+                version = 1
+                while True:
+                    candidate = input_dir / f"product-{len(job['assets']) + version:03d}{extension}"
+                    if not candidate.exists():
+                        break
+                    version += 1
+                candidate.write_bytes(content)
+                product_asset_ids.append(self._add_asset(job, candidate, name, "image", "product_reference"))
+            job["product_asset_ids"] = list(dict.fromkeys(product_asset_ids))
+            job["product_references"] = [job["assets"][asset_id]["path"] for asset_id in job["product_asset_ids"]]
+            job["message"] = "Draft saved locally. No analysis or generation has started."
+            job["updated_at"] = _now()
+            self._save(job)
+        return self.get_job(job_id)
+
+    def analyze_draft(self, job_id: str) -> dict:
+        with self.lock:
+            job = self._read(job_id)
+            if job.get("status") != "draft":
+                raise JobConflict("Only an unanalyzed draft can be submitted for analysis.")
+            if not job.get("instructions", "").strip():
+                raise AppError("Add creative instructions before analyzing this project.")
+            if job.get("mode", "reference") == "reference":
+                reference = Path(job.get("reference_video") or "")
+                if not reference.is_file():
+                    raise AppError("Choose a reference video before analyzing this project.")
+                job.update(status="queued", stage="queued", message="Reference received. Analysis is starting.")
+                worker = self._analyze_job
+            else:
+                job.update(status="analyzing_reference", stage="analyzing_reference", message="The Creative Director is reviewing your idea.")
+                job.setdefault("interview_answers", [])
+                job.setdefault("director_questions", [])
+                worker = self._director_turn
+            job["updated_at"] = _now()
+            self._save(job)
+        self._spawn(worker, job_id)
+        return self.get_job(job_id)
+
     def create_job(
         self,
         video_name: str,
@@ -270,8 +493,11 @@ class LocalJobService:
         instructions: str,
         clip_count: int = 3,
         seconds_per_clip: int = 5,
-        review_images_before_video: bool = False,
+        review_images_before_video: bool = DEFAULT_REVIEW_IMAGES_BEFORE_VIDEO,
+        hook: str = "recommend",
     ) -> dict:
+        if hook not in {"recommend", "in_store_reaction", "wet_works", "countdown_reveal", "gifting", "versus", "custom"}:
+            raise AppError("Choose a supported creative hook.")
         suffix = Path(video_name).suffix.lower()
         if suffix not in {".mp4", ".mov"}:
             raise AppError("Choose an MP4 or MOV reference video.")
@@ -308,7 +534,10 @@ class LocalJobService:
 
         job = {
             "id": job_id,
+            "project_spending_limit_usd": str(DEFAULT_PROJECT_SPENDING_LIMIT_USD),
             "title": _default_project_title("reference", instructions, Path(video_name).name),
+            "mode": "reference",
+            "hook": hook,
             "status": "queued",
             "stage": "queued",
             "message": "Reference received. Analysis is starting.",
@@ -320,7 +549,9 @@ class LocalJobService:
             "product_references": [],
             "instructions": instructions,
             "requested_clip_count": clip_count,
+            "clip_count_selection": "fixed",
             "seconds_per_clip": seconds_per_clip,
+            "duration_selection": "fixed",
             "review_images_before_video": bool(review_images_before_video),
             "assets": {},
             "analysis": None,
@@ -341,10 +572,10 @@ class LocalJobService:
         self._spawn(self._analyze_job, job_id)
         return self.get_job(job_id)
 
-    def create_original_job(self, instructions: str, hook: str = "recommend", clip_count: int = 3, seconds_per_clip: int = 5, product_images: list[tuple[str, bytes]] | None = None, review_images_before_video: bool = False) -> dict:
+    def create_original_job(self, instructions: str, hook: str = "recommend", clip_count: int = 3, seconds_per_clip: int = 5, product_images: list[tuple[str, bytes]] | None = None, review_images_before_video: bool = DEFAULT_REVIEW_IMAGES_BEFORE_VIDEO) -> dict:
         if not instructions.strip() or creative_instruction_length(instructions) > MAX_CREATIVE_INSTRUCTIONS:
             raise AppError("Describe your original video idea in 1–20,000 characters.")
-        if hook not in {"recommend", "wet_works", "countdown_reveal", "gifting", "custom"}:
+        if hook not in {"recommend", "in_store_reaction", "wet_works", "countdown_reveal", "gifting", "versus", "custom"}:
             raise AppError("Choose a supported creative hook.")
         if not 1 <= clip_count <= 12 or not 1 <= seconds_per_clip <= 15:
             raise AppError("Choose 1–12 clips and 1–15 seconds per clip.")
@@ -360,12 +591,14 @@ class LocalJobService:
         job_id = str(uuid.uuid4())
         job = {
             "id": job_id, "title": _default_project_title("original", instructions), "mode": "original", "hook": hook,
+            "project_spending_limit_usd": str(DEFAULT_PROJECT_SPENDING_LIMIT_USD),
             "status": "interviewing", "stage": "interviewing",
             "message": "The Creative Director is reviewing your idea.", "provider_state": None,
             "created_at": _now(), "updated_at": _now(), "reference_video": None,
             "reference_video_info": {}, "product_references": [], "instructions": instructions,
             "interview_answers": [], "director_questions": [], "requested_clip_count": clip_count,
             "seconds_per_clip": seconds_per_clip, "assets": {}, "analysis": None,
+            "clip_count_selection": "fixed", "duration_selection": "fixed",
             "review_images_before_video": bool(review_images_before_video),
             "plan_json": None, "estimate": None, "estimate_reliable": True, "clips": [],
             "charges": {"analysis_usd": "0", "kie_credits": "0", "kie_usd_equivalent": "0", "total_usd": "0", "entries": []},
@@ -381,6 +614,39 @@ class LocalJobService:
         self._save(job)
         self._spawn(self._director_turn, job_id)
         return self.get_job(job_id)
+
+    def set_review_images_before_video(self, job_id: str, enabled: bool) -> dict:
+        if not isinstance(enabled, bool):
+            raise AppError("Choose whether to review starting images before video generation.")
+        job = self._read(job_id)
+        if job.get("status") not in {"ready", "failed", "interrupted"}:
+            raise JobConflict("Starting-image review can only be changed before generation starts.")
+        updated = self._update(job_id, lambda current: current.update(review_images_before_video=enabled))
+        return self._public_job(updated)
+
+    def set_clip_audio_mode(self, job_id: str, clip_index: int, mode: str) -> dict:
+        if mode not in {"auto", "enabled", "silent"}:
+            raise AppError("Choose Auto, Enabled, or Silent for this clip's audio.")
+        with self.lock:
+            job = self._read(job_id)
+            if job.get("status") not in {"ready", "awaiting_image_review", "failed", "interrupted", "completed"}:
+                raise JobConflict("Audio settings can be changed before generation or between runs.")
+            plan = self._load_plan(job)
+            if not 1 <= clip_index <= len(plan.clips):
+                raise AppError("That clip does not exist in this job.")
+            clip = plan.clips[clip_index - 1]
+            clip.audio_mode = mode  # type: ignore[assignment]
+            job["plan_json"] = plan.model_dump_json()
+            job["clips"][clip_index - 1].update(
+                audio_mode=clip.audio_mode,
+                audio_requested=clip.audio_requested,
+                audio_enabled=clip.audio_enabled,
+                audio_direction=clip.audio_direction,
+            )
+            job["message"] = f"Clip {clip_index} audio preference saved; it applies to its next generation or regeneration."
+            job["updated_at"] = _now()
+            self._save(job)
+        return self._public_job(job)
 
     def answer_original_interview(self, job_id: str, answer: str) -> dict:
         if not answer.strip() or creative_instruction_length(answer) > MAX_CREATIVE_INSTRUCTIONS:
@@ -406,7 +672,8 @@ class LocalJobService:
             job = self._read(job_id)
             if job["status"] != "ready" or not job.get("plan_json"):
                 raise JobConflict("The plan can only be refined before generation while the job is ready.")
-            current_plan = MultiClipPlan.model_validate_json(job["plan_json"])
+            self._check_project_spending_limit(job, ANALYSIS_ALLOWANCE_USD)
+            current_plan = self._load_plan(job)
             current_analysis = AnalysisResult.model_validate(job["analysis"])
             context = {
                 "mode": job.get("mode", "reference"), "hook": job.get("hook", ""),
@@ -453,6 +720,7 @@ class LocalJobService:
                         "index": old.index, "duration_seconds": old.duration_seconds,
                         "source_start_seconds": old.source_start_seconds,
                         "source_end_seconds": old.source_end_seconds,
+                        "audio_mode": old.audio_mode,
                     }))
             new_plan = current_plan.model_copy(update={"summary": revision["summary"], "clips": new_clips})
             usage = getattr(self.plan_reviser, "last_usage", {}) or {}
@@ -468,9 +736,10 @@ class LocalJobService:
                 data["estimate_reliable"] = bool(data.get("estimate_reliable", True) and reliable)
                 data["analysis"] = merged_analysis.model_dump(mode="json")
                 data["plan_json"] = new_plan.model_dump_json()
-                data["estimate"] = {"analysis_usd": data["charges"]["analysis_usd"], "images_usd": f"{estimate.image_usd:.4f}", "video_usd": f"{estimate.video_usd:.4f}", "total_usd": f"{estimate.total_usd:.4f}", "clip_count": len(new_clips), "seconds_per_clip": new_clips[0].duration_seconds, "total_video_seconds": estimate.generated_seconds}
+                edit_total = sum(clip.edit_duration_seconds or 0 for clip in new_clips)
+                data["estimate"] = {"analysis_usd": data["charges"]["analysis_usd"], "images_usd": f"{estimate.image_usd:.4f}", "video_usd": f"{estimate.video_usd:.4f}", "total_usd": f"{estimate.total_usd:.4f}", "clip_count": len(new_clips), "seconds_per_clip": new_clips[0].duration_seconds, "total_video_seconds": estimate.generated_seconds, "intended_edit_seconds": edit_total or None}
                 for clip, planned in zip(data["clips"], new_clips):
-                    clip.update(title=planned.title, creative_role=planned.creative_role, action=planned.action, camera=planned.camera, duration_seconds=planned.duration_seconds)
+                    clip.update(title=planned.title, creative_role=planned.creative_role, action=planned.action, camera=planned.camera, duration_seconds=planned.duration_seconds, edit_duration_seconds=planned.edit_duration_seconds, audio_mode=planned.audio_mode, audio_requested=planned.audio_requested, audio_enabled=planned.audio_enabled, audio_direction=planned.audio_direction)
                 data.update(status="ready", stage="ready", message="Creative plan updated. Review the clips and estimate before generation.", error=None)
             return self._public_job(self._update(job_id, finish))
         except Exception as exc:
@@ -489,8 +758,14 @@ class LocalJobService:
         director_usage_recorded = False
         try:
             job = self._read(job_id)
+            self._check_project_spending_limit(job, ANALYSIS_ALLOWANCE_USD)
             director_attempted = True
-            analysis = self.director(job["instructions"], job["interview_answers"], job["hook"])
+            director_instructions = job["instructions"]
+            if job.get("clip_count_selection") == "director":
+                director_instructions += "\nClip count preference: Creative Director decides the purposeful shot count, up to the supported maximum."
+            if job.get("duration_selection") == "director":
+                director_instructions += "\nDuration preference: Creative Director chooses an appropriate generated duration for each planned shot."
+            analysis = self.director(director_instructions, job["interview_answers"], job["hook"])
             director_returned = True
             usage = getattr(self.director, "last_usage", {}) or {}
             cost = price_openai_analysis_usage(usage)
@@ -511,17 +786,31 @@ class LocalJobService:
                     analysis=analysis.model_dump(mode="json"), message="Answer the Creative Director's questions to continue."))
                 return
             seconds = job["seconds_per_clip"]
-            shots = analysis.shots[:job["requested_clip_count"]]
+            requested_hook = job.get("hook", "recommend")
+            if requested_hook in {"in_store_reaction", "wet_works"}:
+                plan_analysis = fit_reference_analysis_to_clip_count(
+                    analysis, job["requested_clip_count"], hook=requested_hook, seconds_per_clip=job["seconds_per_clip"],
+                )
+            else:
+                plan_analysis = analysis.model_copy(deep=True)
+                plan_analysis.shots = plan_analysis.shots[:job["requested_clip_count"]]
+            shots = plan_analysis.shots
             if not shots:
                 raise AppError("The Creative Director did not return a usable shot plan.")
             image_refs = [Path(path) for path in job["product_references"]]
-            plan = build_multiclip_plan(analysis, job["instructions"], "Preserve confirmed product facts and supplied visual references. Do not invent product capabilities.", "the environment specified for this individual scene", len(shots), seconds, product_references=image_refs)
+            plan = build_multiclip_plan(
+                plan_analysis, job["instructions"],
+                "Preserve confirmed product facts and supplied visual references. Do not invent product capabilities.",
+                "the environment specified for this individual scene", len(shots), seconds,
+                product_references=image_refs, hook=requested_hook,
+            )
             estimate = estimate_multiclip_generation(plan, analysis_usd=Decimal(job["charges"]["analysis_usd"]))
-            clips = [{"index": clip.index, "title": clip.title, "creative_role": clip.creative_role, "action": clip.action, "camera": clip.camera, "source_start_seconds": None, "source_end_seconds": None, "duration_seconds": clip.duration_seconds, "status": "planned", "versions": []} for clip in plan.clips]
+            clips = [{"index": clip.index, "title": clip.title, "creative_role": clip.creative_role, "action": clip.action, "camera": clip.camera, "source_start_seconds": None, "source_end_seconds": None, "duration_seconds": clip.duration_seconds, "edit_duration_seconds": clip.edit_duration_seconds, "audio_mode": clip.audio_mode, "audio_requested": clip.audio_requested, "audio_enabled": clip.audio_enabled, "audio_direction": clip.audio_direction, "status": "planned", "versions": []} for clip in plan.clips]
+            edit_total = sum(clip.edit_duration_seconds or 0 for clip in plan.clips)
             self._update(job_id, lambda data: data.update(
                 status="ready", stage="ready", message=f"Creative plan ready: {len(clips)} distinct clips.",
                 analysis=analysis.model_dump(mode="json"), plan_json=plan.model_dump_json(), clips=clips,
-                estimate={"analysis_usd": data["charges"]["analysis_usd"], "images_usd": f"{estimate.image_usd:.4f}", "video_usd": f"{estimate.video_usd:.4f}", "total_usd": f"{estimate.total_usd:.4f}", "clip_count": len(clips), "seconds_per_clip": seconds, "total_video_seconds": estimate.generated_seconds},
+                estimate={"analysis_usd": data["charges"]["analysis_usd"], "images_usd": f"{estimate.image_usd:.4f}", "video_usd": f"{estimate.video_usd:.4f}", "total_usd": f"{estimate.total_usd:.4f}", "clip_count": len(clips), "seconds_per_clip": seconds, "total_video_seconds": estimate.generated_seconds, "intended_edit_seconds": edit_total or None},
                 estimate_reliable=data["estimate_reliable"], director_questions=[]))
         except Exception as exc:
             if director_attempted and not director_usage_recorded:
@@ -561,12 +850,18 @@ class LocalJobService:
             job_dir = self._job_path(job_id).parent
             frame_dir = job_dir / "frames"
             frames = self.frame_sampler(video_path, frame_dir, count=8)
+            self._check_project_spending_limit(job, ANALYSIS_ALLOWANCE_USD)
             analysis_attempted = True
             analysis = self.analyzer(
                 frames,
                 job["instructions"],
                 "Use supplied product images as authoritative appearance references. Do not invent product construction or capabilities.",
                 reference_duration_seconds=job["reference_video_info"]["duration"],
+                hook=job.get("hook") or ("in_store_reaction" if re.search(r"\b(?:in[- ]store reaction|wet works)\b", job["instructions"], re.I) else "recommend"),
+                clip_count=job["requested_clip_count"],
+                seconds_per_clip=job["seconds_per_clip"],
+                duration_selection=job.get("duration_selection", "fixed"),
+                reference_has_audio=job["reference_video_info"].get("has_audio"),
             )
             analysis_returned = True
             analysis = normalize_reference_segments(analysis, job["reference_video_info"]["duration"])
@@ -579,6 +874,14 @@ class LocalJobService:
                 raise AppError("The reference analysis did not identify any usable shots.")
 
             clip_count = min(job["requested_clip_count"], len(analysis.shots))
+            selected_hook = job.get("hook") or ("in_store_reaction" if re.search(r"\b(?:in[- ]store reaction|wet works)\b", job["instructions"], re.I) else "recommend")
+            if selected_hook in {"in_store_reaction", "wet_works"}:
+                plan_analysis = fit_reference_analysis_to_clip_count(
+                    analysis, clip_count, hook=selected_hook, seconds_per_clip=job["seconds_per_clip"],
+                )
+            else:
+                plan_analysis = analysis.model_copy(deep=True)
+                plan_analysis.shots = plan_analysis.shots[:clip_count]
             if job["product_references"]:
                 image_refs = [Path(path) for path in job["product_references"]]
             else:
@@ -592,24 +895,32 @@ class LocalJobService:
                 "When no product photos are supplied, use the reference video frames. Do not infer unseen capabilities."
             )
             plan = build_multiclip_plan(
-                analysis,
+                plan_analysis,
                 job["instructions"],
                 product_facts,
                 environment,
                 clip_count,
                 job["seconds_per_clip"],
                 product_references=image_refs,
+                hook=selected_hook,
             )
             estimate = estimate_multiclip_generation(plan, analysis_usd=analysis_usd)
+            edit_total = sum(clip.edit_duration_seconds or 0 for clip in plan.clips)
             public_analysis = analysis.model_dump(mode="json")
             clips = [{
                 "index": clip.index,
                 "title": clip.title,
+                "creative_role": clip.creative_role,
                 "action": clip.action,
                 "camera": clip.camera,
                 "source_start_seconds": clip.source_start_seconds,
                 "source_end_seconds": clip.source_end_seconds,
                 "duration_seconds": clip.duration_seconds,
+                "edit_duration_seconds": clip.edit_duration_seconds,
+                "audio_mode": clip.audio_mode,
+                "audio_requested": clip.audio_requested,
+                "audio_enabled": clip.audio_enabled,
+                "audio_direction": clip.audio_direction,
                 "status": "planned",
                 "versions": [],
             } for clip in plan.clips]
@@ -629,6 +940,7 @@ class LocalJobService:
                         "clip_count": len(clips),
                         "seconds_per_clip": job["seconds_per_clip"],
                         "total_video_seconds": estimate.generated_seconds,
+                        "intended_edit_seconds": edit_total or None,
                     },
                     estimate_reliable=reliable,
                     clips=clips,
@@ -669,16 +981,54 @@ class LocalJobService:
                         "processing_outputs": "saving its video output",
                     }.get(stage, stage)
                     detail = re.sub(r"Bearer\s+[^\s]+", "Bearer [redacted]", str(message))[:500]
-                    safe_message = (f"Clip {clip} failed while {stage}: {detail}. Finished clips and reported charges are preserved. Resume reuses saved starting images and provider tasks.") if clip else f"Generation failed: {detail}. Finished clips and reported charges are preserved."
+                    if clip and stage == "preparing its starting image":
+                        safe_message = (f"Clip {clip} failed while preparing its starting image: {detail}. Saved starting images and provider task history are preserved. "
+                                        "Retrying will reuse completed images and submit a new task only for this failed image; check provider-reported usage before retrying.")
+                    else:
+                        safe_message = (f"Clip {clip} failed while {stage}: {detail}. Finished clips and reported charges are preserved. Resume reuses saved starting images and provider tasks.") if clip else f"Generation failed: {detail}. Finished clips and reported charges are preserved."
                 job.update(status="failed", stage="failed", message=safe_message, error=safe_message)
             self._update(job_id, fail)
         except JobNotFound:
             return
 
     def _estimate(self, job: dict):
-        plan = MultiClipPlan.model_validate_json(job["plan_json"])
+        plan = self._load_plan(job)
         analysis_cost = Decimal(job.get("charges", {}).get("analysis_usd", "0"))
         return estimate_multiclip_generation(plan, analysis_usd=analysis_cost)
+
+    def _video_operation(self, job: dict) -> tuple[str, Decimal]:
+        plan = self._load_plan(job)
+        image_ids = [clip.get("current_starting_image_asset") for clip in sorted(job.get("clips", []), key=lambda item: item.get("index", 0))]
+        operation = hashlib.sha256((plan.model_dump_json() + json.dumps(image_ids, separators=(",", ":"))).encode()).hexdigest()
+        amount = sum((Decimal(str(clip.duration_seconds)) * Decimal("0.0225") for clip in plan.clips), Decimal("0"))
+        return operation, amount
+
+    def _bind_video_authorization(self, job_id: str) -> None:
+        def bind(job: dict) -> None:
+            approved = job.get("approved_max_usd")
+            if not approved:
+                return
+            operation, amount = self._video_operation(job)
+            if estimate_within_approved_amount(amount, Decimal(approved)):
+                job["video_generation_authorization"] = {
+                    "operation": operation,
+                    "approved_max_usd": approved,
+                    "authorized_at": _now(),
+                }
+        self._update(job_id, bind)
+
+    @staticmethod
+    def _load_plan(job: dict) -> MultiClipPlan:
+        plan = MultiClipPlan.model_validate_json(job["plan_json"])
+        selected_hook = job.get("hook")
+        automatic_hook = selected_hook in {None, "", "recommend"}
+        if automatic_hook and plan.hook in {"custom", "recommend"} and re.search(
+            r"\b(?:in[- ]store reaction|wet works)\b", job.get("instructions", ""), re.I,
+        ):
+            selected_hook = "in_store_reaction"
+        if selected_hook in {"in_store_reaction", "wet_works", "countdown_reveal", "gifting", "versus", "custom"}:
+            plan = plan.model_copy(update={"hook": selected_hook})
+        return plan
 
     def start_generation(self, job_id: str, approved_max_usd: Decimal | None = None, resume: bool = False, review_images: bool | None = None) -> dict:
         with self.lock:
@@ -686,17 +1036,10 @@ class LocalJobService:
             recoverable = resume and job["status"] in {"failed", "interrupted"} and bool(job.get("plan_json"))
             if job["status"] != "ready" and not recoverable:
                 raise JobConflict("This job is not ready to generate. Check its current status.")
-            estimate = self._estimate(job)
-            if generation_approval_required(
-                estimate,
-                pricing_verified=True,
-                estimate_reliable=job["estimate_reliable"],
-            ) and approved_max_usd is None:
-                raise ConfirmationRequired(estimate.total_usd, "This job exceeds the automatic-spend threshold or its estimate is uncertain.")
-            if approved_max_usd is not None and approved_max_usd < estimate.total_usd:
-                raise AppError(f"Estimated total ${estimate.total_usd:.4f} exceeds the approved maximum ${approved_max_usd:.4f}.")
+            retry_image_info = self._resume_image_retry_info(job) if recoverable else None
             pending_image_regen = job.get("pending_starting_image_regen") if recoverable else None
             pending_clip_regen = job.get("pending_clip_regeneration") if recoverable else None
+            estimate = self._estimate(job)
             saved_images_ready = bool(job.get("clips")) and all(
                 clip.get("current_starting_image_asset") and
                 Path(job.get("assets", {}).get(clip["current_starting_image_asset"], {}).get("path", "")).is_file()
@@ -704,6 +1047,34 @@ class LocalJobService:
             )
             videos_ready = (bool(job.get("images_approved_at")) or
                             (recoverable and not job.get("review_images_before_video", False) and saved_images_ready)) and not pending_image_regen
+            video_operation = None
+            video_estimate = None
+            if videos_ready:
+                video_operation, video_estimate = self._video_operation(job)
+                authorization = job.get("video_generation_authorization") or {}
+                authorized = authorization.get("operation") == video_operation
+                if authorized and approved_max_usd is None:
+                    approved_max_usd = Decimal(authorization["approved_max_usd"])
+            if pending_image_regen:
+                pending_clip = bool(pending_image_regen.get("clip_regeneration"))
+                pending_duration = self._load_plan(job).clips[int(pending_image_regen["clip_index"]) - 1].duration_seconds
+                operation_estimate = (Decimal(str(pending_duration)) * Decimal("0.0225")
+                                      if pending_clip and pending_image_regen.get("image_ready")
+                                      else IMAGE_1K_USD)
+            elif videos_ready:
+                operation_estimate = video_estimate
+            else:
+                operation_estimate = Decimal(retry_image_info["estimated_usd"]) if retry_image_info else estimate.total_usd
+            confirmation_needed = (
+                operation_estimate > AUTO_GENERATION_APPROVAL_LIMIT_USD or not job["estimate_reliable"]
+                if retry_image_info or pending_image_regen or videos_ready else generation_approval_required(estimate, pricing_verified=True, estimate_reliable=job["estimate_reliable"])
+            )
+            if confirmation_needed and approved_max_usd is None:
+                raise ConfirmationRequired(operation_estimate, "This job exceeds the automatic-spend threshold or its estimate is uncertain.")
+            if approved_max_usd is not None and not estimate_within_approved_amount(operation_estimate, approved_max_usd):
+                raise AppError(f"Estimated total ${operation_estimate:.4f} exceeds the approved maximum ${approved_max_usd:.4f}.")
+            project_operation_estimate = operation_estimate if (retry_image_info or pending_image_regen or videos_ready) else estimate.image_usd + estimate.video_usd
+            self._check_project_spending_limit(job, project_operation_estimate)
             if pending_clip_regen and not pending_clip_regen.get("image_ready"):
                 pending_image_regen = {"clip_index": pending_clip_regen["clip_index"],
                     "instructions": pending_clip_regen["instructions"], "output_dir": pending_clip_regen["output_dir"],
@@ -722,6 +1093,13 @@ class LocalJobService:
             if review_images is not None and not recoverable:
                 job["review_images_before_video"] = bool(review_images)
             job["approved_max_usd"] = str(approved_max_usd) if approved_max_usd is not None else None
+            if videos_ready and approved_max_usd is not None:
+                job["video_generation_authorization"] = {
+                    "operation": video_operation,
+                    "approved_max_usd": str(approved_max_usd),
+                    "authorized_at": _now(),
+                }
+            job["resume_operation"] = retry_image_info
             job["provider_state"] = None
             job["updated_at"] = _now()
             self._save(job)
@@ -735,7 +1113,7 @@ class LocalJobService:
 
     def _generate_job(self, job_id: str) -> None:
         job = self._read(job_id)
-        plan = MultiClipPlan.model_validate_json(job["plan_json"])
+        plan = self._load_plan(job)
         output_dir = self._job_path(job_id).parent / "outputs" / "initial"
         analysis_usd = Decimal(job["charges"]["analysis_usd"])
 
@@ -783,6 +1161,8 @@ class LocalJobService:
 
         self._collect_charges(job_id, output_dir, "initial_generation")
         self._save_starting_image_assets(job_id, plan, outputs)
+        self._bind_video_authorization(job_id)
+        self._update(job_id, lambda data: data.update(resume_operation=None))
         current = self._read(job_id)
         if not current.get("review_images_before_video", False):
             self._update(job_id, lambda data: data.update(status="generating_clips", stage="generating_clips",
@@ -797,7 +1177,7 @@ class LocalJobService:
 
     def _save_starting_image_assets(self, job_id: str, plan: MultiClipPlan, images: list[Path]) -> None:
         saved_job = self._read(job_id)
-        full_plan = MultiClipPlan.model_validate_json(saved_job["plan_json"])
+        full_plan = self._load_plan(saved_job)
         identity_index = product_identity_clip_index(full_plan)
         def change(job: dict) -> None:
             for clip, image_path in zip(plan.clips, images):
@@ -821,7 +1201,7 @@ class LocalJobService:
         asset_id = job.get("product_identity_reference_asset")
         if not asset_id:
             try:
-                plan = MultiClipPlan.model_validate_json(job["plan_json"])
+                plan = self._load_plan(job)
                 identity_index = product_identity_clip_index(plan)
                 clip = next((item for item in job.get("clips", []) if item.get("index") == identity_index), None)
                 asset_id = clip.get("current_starting_image_asset") if clip else None
@@ -831,7 +1211,131 @@ class LocalJobService:
         path = Path(asset["path"]) if asset and asset.get("path") else None
         return path if path and path.is_file() else None
 
-    def approve_starting_images(self, job_id: str) -> dict:
+    def _character_identity_reference_paths(self, job: dict, plan: MultiClipPlan, clip: PlannedClip) -> list[Path]:
+        """Return one same-group identity anchor, preferring an approved image."""
+        groups = {group.strip() for group in clip.character_groups if group.strip()}
+        if not groups:
+            return []
+        planned = {item.index: item for item in plan.clips}
+        candidates: dict[str, list[tuple[int, Path, bool]]] = {group: [] for group in groups}
+        approved_ids = set(job.get("approved_starting_image_assets", []))
+        if job.get("images_approved_at"):
+            approved_ids.update({
+                record.get("current_starting_image_asset")
+                for record in job.get("clips", [])
+                if record.get("current_starting_image_asset")
+            })
+        for record in job.get("clips", []):
+            index = record.get("index")
+            if index == clip.index or index not in planned:
+                continue
+            history = record.get("starting_image_history", [])
+            asset_ids = [item.get("asset_id") for item in history if item.get("asset_id")]
+            current_id = record.get("current_starting_image_asset")
+            if current_id and current_id not in asset_ids:
+                asset_ids.append(current_id)
+            approved_entries = []
+            for asset_id in asset_ids:
+                asset = job.get("assets", {}).get(asset_id, {})
+                path = Path(asset.get("path", ""))
+                if path.is_file() and asset_id in approved_ids:
+                    approved_entries.append((index, path, True))
+            if approved_entries:
+                version_by_path = {
+                    Path(job.get("assets", {}).get(item.get("asset_id"), {}).get("path", "")).resolve(): item.get("version", 0)
+                    for item in history if item.get("asset_id")
+                }
+                record_candidates = [max(approved_entries, key=lambda item: version_by_path.get(item[1].resolve(), 0))]
+            else:
+                current_asset = job.get("assets", {}).get(current_id, {}) if current_id else {}
+                current_path = Path(current_asset.get("path", ""))
+                record_candidates = [(index, current_path, False)] if current_path.is_file() else []
+            if not record_candidates:
+                continue
+            for group in groups.intersection(g.strip() for g in planned[index].character_groups):
+                candidates[group].extend(record_candidates)
+        selected = []
+        seen = set()
+        for group in sorted(groups):
+            if candidates[group]:
+                # When the set has been approved, do not let a newer unapproved
+                # edit silently replace the established identity anchor.
+                same_group = candidates[group]
+                approved = [item for item in same_group if item[2]]
+                path = min(approved or same_group, key=lambda item: item[0])[1]
+                if path not in seen:
+                    selected.append(path)
+                    seen.add(path)
+        return selected
+
+    def get_scene_reference(self, job_id: str, clip_index: int, reference_index: int) -> tuple[Path, str, str]:
+        job = self._read(job_id)
+        plan = self._load_plan(job)
+        if not 1 <= clip_index <= len(plan.clips):
+            raise JobNotFound("Scene reference not found")
+        references = plan.clips[clip_index - 1].environment_references
+        if not 0 <= reference_index < len(references):
+            raise JobNotFound("Scene reference not found")
+        path = Path(references[reference_index]).expanduser().resolve()
+        root = self._job_path(job_id).parent.resolve()
+        media_type = mimetypes.guess_type(path.name)[0] or "application/octet-stream"
+        if root not in path.parents or not path.is_file() or not media_type.startswith("image/"):
+            raise JobNotFound("Scene reference not found")
+        return path, media_type, path.name
+
+    def _resolve_scene_base(self, job_id: str, job: dict, source: str) -> Path:
+        if source.startswith("asset:"):
+            asset_id = source.removeprefix("asset:")
+            asset = job.get("assets", {}).get(asset_id)
+            if not asset or asset.get("role") != "starting_image" or not str(asset.get("media_type", "")).startswith("image/"):
+                raise AppError("Choose a saved starting image or a planned scene environment reference as the edit base.")
+            path = Path(asset["path"]).expanduser().resolve()
+            root = self._job_path(job_id).parent.resolve()
+            if root not in path.parents or not path.is_file():
+                raise AppError("The selected scene image is unavailable.")
+            return path
+        match = re.fullmatch(r"environment:(\d+):(\d+)", source)
+        if match:
+            path, _, _ = self.get_scene_reference(job_id, int(match.group(1)), int(match.group(2)))
+            return path
+        raise AppError("Choose a saved starting image or a planned scene environment reference as the edit base.")
+
+    def scene_base_images(self, job_id: str, job: dict) -> list[dict]:
+        outputs = self._job_path(job_id).parent / "outputs"
+        candidates = []
+        for clip in job.get("clips", []):
+            for history in clip.get("starting_image_history", []):
+                asset_id = history.get("asset_id")
+                asset = job.get("assets", {}).get(asset_id, {})
+                path = Path(asset.get("path", "")).expanduser().resolve()
+                if asset.get("role") != "starting_image" or not path.is_file():
+                    continue
+                candidates.append({
+                    "value": f"asset:{asset_id}",
+                    "label": f"Clip {clip['index']} image v{history.get('version', '?')} · {asset.get('filename', path.name)}",
+                    "url": f"/api/jobs/{job_id}/assets/{asset_id}",
+                    "mask_available": bool(find_saved_mask_for_scene(outputs, path)),
+                })
+        try:
+            plan = self._load_plan(job)
+        except (KeyError, ValueError):
+            plan = None
+        if plan:
+            for clip in plan.clips:
+                for ref_index, raw_path in enumerate(clip.environment_references):
+                    path = Path(raw_path).expanduser().resolve()
+                    root = self._job_path(job_id).parent.resolve()
+                    if root not in path.parents or not path.is_file() or not (mimetypes.guess_type(path.name)[0] or "").startswith("image/"):
+                        continue
+                    candidates.append({
+                        "value": f"environment:{clip.index}:{ref_index}",
+                        "label": f"Clip {clip.index} scene reference · {path.name}",
+                        "url": f"/api/jobs/{job_id}/scene-references/{clip.index}/{ref_index}",
+                        "mask_available": bool(find_saved_mask_for_scene(outputs, path)),
+                    })
+        return candidates
+
+    def approve_starting_images(self, job_id: str, approved_max_usd: Decimal | None = None) -> dict:
         with self.lock:
             job = self._read(job_id)
             if job.get("status") != "awaiting_image_review":
@@ -841,15 +1345,49 @@ class LocalJobService:
                 asset = job.get("assets", {}).get(asset_id) if asset_id else None
                 if not asset or not Path(asset.get("path", "")).is_file():
                     raise JobConflict(f"Clip {clip.get('index')} is missing a readable starting image. Resume image preparation before approval.")
+            pending_clip = job.get("pending_clip_regeneration")
+            if pending_clip:
+                clip = self._load_plan(job).clips[int(pending_clip["clip_index"]) - 1]
+                operation = None
+                operation_estimate = Decimal(str(clip.duration_seconds)) * Decimal("0.0225")
+                if approved_max_usd is None and pending_clip.get("approved_max_usd"):
+                    approved_max_usd = Decimal(pending_clip["approved_max_usd"])
+            else:
+                operation, operation_estimate = self._video_operation(job)
+                authorization = job.get("video_generation_authorization") or {}
+                if authorization.get("operation") == operation and approved_max_usd is None:
+                    approved_max_usd = Decimal(authorization["approved_max_usd"])
+            confirmation_needed = operation_estimate > AUTO_GENERATION_APPROVAL_LIMIT_USD or not job.get("estimate_reliable", True)
+            if confirmation_needed and approved_max_usd is None:
+                raise ConfirmationRequired(operation_estimate, "Video generation exceeds the automatic-spend threshold or its estimate is uncertain.")
+            if approved_max_usd is not None and not estimate_within_approved_amount(operation_estimate, approved_max_usd):
+                raise AppError(f"Estimated video cost ${operation_estimate:.4f} exceeds the approved maximum ${approved_max_usd:.4f}.")
+            self._check_project_spending_limit(job, operation_estimate)
+            if approved_max_usd is not None and not pending_clip:
+                job["video_generation_authorization"] = {
+                    "operation": operation,
+                    "approved_max_usd": str(approved_max_usd),
+                    "authorized_at": _now(),
+                }
+            elif not pending_clip:
+                job.pop("video_generation_authorization", None)
             job.update(images_approved_at=_now(), status="generating_clips", stage="generating_clips",
                        message="Starting images approved. Generating planned clips.", error=None,
-                       resume_generation=True, updated_at=_now())
+                       resume_generation=True, resume_operation=None, updated_at=_now())
+            job["approved_starting_image_assets"] = [
+                clip.get("current_starting_image_asset") for clip in job.get("clips", [])
+                if clip.get("current_starting_image_asset")
+            ]
             self._save(job)
             is_clip_regeneration = bool(job.get("pending_clip_regeneration"))
         self._spawn(self._generate_regenerated_clip if is_clip_regeneration else self._generate_videos, job_id)
         return self.get_job(job_id)
 
-    def regenerate_starting_image(self, job_id: str, clip_index: int, instructions: str = "", approved_max_usd: Decimal | None = None) -> dict:
+    def regenerate_starting_image(
+        self, job_id: str, clip_index: int, instructions: str = "",
+        approved_max_usd: Decimal | None = None, *, masked_edit: bool = False,
+        base_source: str | None = None, mask_upload: tuple[str, bytes] | None = None,
+    ) -> dict:
         with self.lock:
             job = self._read(job_id)
             if job.get("status") != "awaiting_image_review":
@@ -861,56 +1399,136 @@ class LocalJobService:
                 raise JobConflict("This clip does not have a starting image to revise.")
             if len(instructions) > 1200:
                 raise AppError("Image revision instructions must be 1,200 characters or fewer.")
+            estimate = MASKED_EDIT_1K_USD if masked_edit else IMAGE_1K_USD
+            scene_base = None
+            mask_path = None
+            if masked_edit:
+                if not base_source:
+                    raise AppError("Select an appropriate saved scene image before using masked editing.")
+                scene_base = self._resolve_scene_base(job_id, job, base_source)
+                mask_path = find_saved_mask_for_scene(self._job_path(job_id).parent / "outputs", scene_base)
+                if mask_upload:
+                    filename, data = mask_upload
+                    if len(data) > MAX_MASK_IMAGE_BYTES:
+                        raise AppError("Mask images must be 20 MB or smaller.")
+                    if not filename.lower().endswith(".png") or not data.startswith(b"\x89PNG\r\n\x1a\n"):
+                        raise AppError("Upload the localized edit mask as a PNG.")
+                    output_dir = self._job_path(job_id).parent / "outputs" / f"clip-{clip_index:02d}" / "starting-image" / f"version-{len(clip_record.get('starting_image_history', [])) + 1}"
+                    output_dir.mkdir(parents=True, exist_ok=True)
+                    mask_path = output_dir / "scene-inpaint-mask.png"
+                    mask_path.write_bytes(data)
+                if not mask_path or not mask_path.is_file():
+                    raise AppError("This scene image has no matching saved mask. Upload a transparent PNG mask, or choose a scene image with a saved mask.")
+                _validate_mask_png(mask_path, scene_base)
             if job.get("estimate_reliable") is False:
                 if approved_max_usd is None:
-                    raise ConfirmationRequired(IMAGE_1K_USD, "Image pricing or this project's estimate is uncertain; approval is required before regenerating this image.")
-            if approved_max_usd is not None and approved_max_usd < IMAGE_1K_USD:
-                raise AppError(f"Estimated image cost ${IMAGE_1K_USD:.2f} exceeds the approved maximum ${approved_max_usd:.2f}.")
-            clip = MultiClipPlan.model_validate_json(job["plan_json"]).clips[clip_index - 1]
+                    raise ConfirmationRequired(estimate, "Image pricing or this project's estimate is uncertain; approval is required before regenerating this image.")
+            if approved_max_usd is not None and not estimate_within_approved_amount(estimate, approved_max_usd):
+                raise AppError(f"Estimated image cost ${estimate:.2f} exceeds the approved maximum ${approved_max_usd:.2f}.")
+            self._check_project_spending_limit(job, estimate)
+            clip = self._load_plan(job).clips[clip_index - 1]
             output_dir = self._job_path(job_id).parent / "outputs" / f"clip-{clip_index:02d}" / "starting-image" / f"version-{len(clip_record.get('starting_image_history', [])) + 1}"
+            if job.get("images_approved_at") and not job.get("approved_starting_image_assets"):
+                job["approved_starting_image_assets"] = [
+                    record.get("current_starting_image_asset") for record in job.get("clips", [])
+                    if record.get("current_starting_image_asset")
+                ]
             job.update(status="regenerating_starting_image", stage="regenerating_starting_image",
-                       message=f"Regenerating the starting image for clip {clip_index} (~${IMAGE_1K_USD:.2f}).",
+                       message=f"Regenerating the starting image for clip {clip_index} (~${estimate:.2f}).",
                        active_clip=clip_index, active_stage="regenerating_starting_image", error=None,
                        images_approved_at=None, updated_at=_now())
-            job["pending_starting_image_regen"] = {"clip_index": clip_index, "instructions": instructions.strip(), "output_dir": str(output_dir)}
+            job["pending_starting_image_regen"] = {
+                "clip_index": clip_index, "instructions": instructions.strip(), "output_dir": str(output_dir),
+                "masked_edit": masked_edit, "base_source": base_source if masked_edit else None,
+                "mask_path": str(mask_path) if mask_path else None,
+            }
             self._save(job)
-        self._spawn(self._regenerate_starting_image, job_id, clip, instructions.strip(), output_dir)
+        self._spawn(self._regenerate_starting_image, job_id, clip, instructions.strip(), output_dir,
+                    False, masked_edit, scene_base, mask_path)
         return self.get_job(job_id)
 
     def _resume_starting_image_regen(self, job_id: str) -> None:
         job = self._read(job_id)
         pending = job.get("pending_starting_image_regen") or {}
-        plan = MultiClipPlan.model_validate_json(job["plan_json"])
+        plan = self._load_plan(job)
         index = int(pending["clip_index"])
         if pending.get("clip_regeneration"):
             self._prepare_regenerated_clip_image(job_id, index, pending.get("instructions", ""), Path(pending["output_dir"]), resume=True)
             return
-        self._regenerate_starting_image(job_id, plan.clips[index - 1], pending.get("instructions", ""), Path(pending["output_dir"]), resume=True)
+        base = self._resolve_scene_base(job_id, job, pending["base_source"]) if pending.get("masked_edit") else None
+        self._regenerate_starting_image(
+            job_id, plan.clips[index - 1], pending.get("instructions", ""), Path(pending["output_dir"]),
+            resume=True, masked_edit=bool(pending.get("masked_edit")), scene_base=base,
+            mask_path=Path(pending["mask_path"]) if pending.get("mask_path") else None,
+        )
 
-    def _regenerate_starting_image(self, job_id: str, clip: PlannedClip, instructions: str, output_dir: Path, resume: bool = False) -> None:
+    def _regenerate_starting_image(
+        self, job_id: str, clip: PlannedClip, instructions: str, output_dir: Path,
+        resume: bool = False, masked_edit: bool = False, scene_base: Path | None = None,
+        mask_path: Path | None = None,
+    ) -> None:
         job = self._read(job_id)
-        plan = MultiClipPlan.model_validate_json(job["plan_json"])
+        plan = self._load_plan(job)
+        planned_clips = {candidate.index: candidate for candidate in plan.clips}
         current_images = {}
         for record in job["clips"]:
             asset_id = record.get("current_starting_image_asset")
             if asset_id and record["index"] != clip.index:
                 current_images[record["index"]] = Path(job["assets"][asset_id]["path"])
-        prompt_clip = clip.model_copy(update={"starting_image_prompt": clip.starting_image_prompt + (f"\nRequested revision: {instructions}" if instructions else "")})
+        in_store_opening = plan.hook in {"in_store_reaction", "wet_works"} and clip.index == 1
+        prompt_clip = clip.model_copy(update={
+            "starting_image_prompt": starting_image_revision_prompt(plan, clip, instructions),
+        })
         single_plan = plan.model_copy(update={"clips": [prompt_clip]})
         old_asset = job["clips"][clip.index - 1]["current_starting_image_asset"]
         old_path = Path(job["assets"][old_asset]["path"])
-        identity_path = self._product_identity_reference_path(job)
-        continuity = ([identity_path] if identity_path and identity_path != old_path else [])
-        continuity.extend(path for path in current_images.values() if path.is_file() and path not in continuity)
-        if not continuity and old_path.is_file():
-            continuity = [old_path]
+        target_group = clip.continuity_group.strip()
+        continuity = []
+        continuity_roles = []
+        character_references = self._character_identity_reference_paths(job, plan, clip)
+        has_scene_environment_reference = bool(clip.environment_references)
+        if target_group and not has_scene_environment_reference:
+            peers = [
+                (abs(index - clip.index), index, path)
+                for index, path in current_images.items()
+                if path.is_file()
+                and index in planned_clips
+                and planned_clips[index].continuity_group.strip() == target_group
+            ]
+            # Without an explicit environment image, one nearby same-group image
+            # can supply the scene. A dedicated environment input takes priority.
+            if peers:
+                continuity.append(min(peers)[2])
+                continuity_roles.append(
+                    "same-scene identity, wardrobe, and environment only; ignore facial expression and pose"
+                    if in_store_opening else
+                    "same-scene environment only; preserve setting and lighting, ignore people, faces, wardrobe, and pose"
+                )
+        # Do not feed a stale target pose back when an explicit environment
+        # reference is available; character and product inputs carry those roles.
+        if (old_path.is_file() and old_path not in continuity and not in_store_opening
+                and not has_scene_environment_reference):
+            continuity.append(old_path)
+            continuity_roles.append("pose and held objects only; ignore background")
         client = None
         try:
             client = self.client_factory()
-            image_estimate = estimate_multiclip_generation(single_plan, analysis_usd=Decimal("0"))
-            images = run_multiclip_generation(single_plan, [Path(p) for p in plan.product_references], continuity,
-                output_dir, client, pricing_verified=True, estimate_reliable=True,
-                approved_max_usd=image_estimate.total_usd, resume=resume, images_only=True)
+            if masked_edit:
+                if not scene_base or not mask_path:
+                    raise AppError("The saved masked-edit inputs are incomplete; no request was submitted.")
+                image_path = run_masked_image_edit(
+                    single_plan, prompt_clip, scene_base, mask_path,
+                    [Path(p) for p in plan.product_references], character_references,
+                    output_dir, client, scene_prompt=prompt_clip.starting_image_prompt, resume=resume,
+                )
+                images = [image_path]
+            else:
+                image_estimate = estimate_multiclip_generation(single_plan, analysis_usd=Decimal("0"))
+                images = run_multiclip_generation(single_plan, [Path(p) for p in plan.product_references], continuity,
+                    output_dir, client, pricing_verified=True, estimate_reliable=True,
+                    approved_max_usd=image_estimate.total_usd, resume=resume, images_only=True,
+                    continuity_reference_roles=continuity_roles,
+                    character_references=character_references)
         except Exception as exc:
             self._collect_charges(job_id, output_dir, f"clip_{clip.index}_starting_image_v{len(job['clips'][clip.index - 1].get('starting_image_history', [])) + 1}")
             try:
@@ -936,7 +1554,7 @@ class LocalJobService:
 
     def _generate_videos(self, job_id: str) -> None:
         job = self._read(job_id)
-        plan = MultiClipPlan.model_validate_json(job["plan_json"])
+        plan = self._load_plan(job)
         output_dir = self._job_path(job_id).parent / "outputs" / "initial"
         image_paths = {clip["index"]: Path(job["assets"][clip["current_starting_image_asset"]]["path"])
                        for clip in job["clips"] if clip.get("current_starting_image_asset")}
@@ -949,7 +1567,9 @@ class LocalJobService:
             client = self.client_factory()
             outputs = run_multiclip_generation(plan, [Path(path) for path in plan.product_references],
                 [Path(path) for path in plan.continuity_references], output_dir, client,
-                approved_max_usd=Decimal(job["approved_max_usd"]) if job.get("approved_max_usd") else None,
+                approved_max_usd=(Decimal(job["video_generation_authorization"]["approved_max_usd"])
+                                  if job.get("video_generation_authorization", {}).get("operation") == self._video_operation(job)[0]
+                                  else None),
                 pricing_verified=True, estimate_reliable=job["estimate_reliable"],
                 analysis_usd=Decimal(job["charges"]["analysis_usd"]), on_progress=progress,
                 resume=True, starting_images=image_paths)
@@ -1032,6 +1652,22 @@ class LocalJobService:
             self._update(job_id, record)
         except JobNotFound:
             return
+
+    def _check_project_spending_limit(self, job: dict, additional_estimate: Decimal) -> None:
+        spending = self._project_spending(job)
+        unresolved = [record for record in spending["records"]
+                      if record.get("status") == "unknown_usage"
+                      and not re.search(r"Kie task (?:submitted|processing|queued|pending);", str(record.get("basis", "")))]
+        if unresolved:
+            raise AppError("This project has provider charges with unknown amounts, so its spending ceiling cannot be verified safely.")
+        limit = Decimal(str(job.get("project_spending_limit_usd", DEFAULT_PROJECT_SPENDING_LIMIT_USD)))
+        recorded = Decimal(spending["recorded_usd_equivalent"])
+        projected = recorded + reserve_estimate_usd(additional_estimate)
+        if projected > limit:
+            raise AppError(
+                f"This operation would bring project spending to about ${projected:.4f}, "
+                f"above the ${limit:.2f} project limit. Recorded usage: ${recorded:.6f}."
+            )
 
     def _project_spending(self, job: dict) -> dict:
         """Build a cumulative usage ledger from persisted OpenAI and Kie evidence."""
@@ -1259,7 +1895,12 @@ class LocalJobService:
                 history = target.setdefault("starting_image_history", [])
                 history.append({"version": len(history) + 1, "asset_id": image_id, "created_at": _now()})
                 target["current_starting_image_asset"] = image_id
-            video_id = self._add_asset(job, video_path, f"clip-{clip.index:02d}.mp4", "video", "silent_video")
+            audio_enabled = clip.audio_enabled
+            # run_multiclip_generation validates stream presence and relative
+            # timestamps before returning; preserve that verified result here.
+            audio_present = audio_enabled
+            video_role = "video_with_native_audio" if audio_present else "silent_video"
+            video_id = self._add_asset(job, video_path, f"clip-{clip.index:02d}.mp4", "video", video_role)
             target["status"] = "completed"
             target["versions"].append({
                 "version": len(target["versions"]) + 1,
@@ -1267,6 +1908,10 @@ class LocalJobService:
                 "video_asset": video_id,
                 "duration_seconds": clip.duration_seconds,
                 "revision": revision,
+                "audio_mode": clip.audio_mode,
+                "audio_enabled": audio_enabled,
+                "audio_direction": clip.audio_direction,
+                "audio_present": audio_present,
                 "actual_kie_usd_equivalent": f"{actual_cost:.4f}" if actual_cost is not None else None,
             })
         self._update(job_id, change)
@@ -1298,7 +1943,7 @@ class LocalJobService:
                         {"version": version.get("version", index + 1), "asset_id": version.get("starting_image_asset"), "created_at": None}
                         for index, version in enumerate(record["versions"]) if version.get("starting_image_asset")
                     ])
-            clip = MultiClipPlan.model_validate_json(job["plan_json"]).clips[clip_index - 1]
+            clip = self._load_plan(job).clips[clip_index - 1]
             single_plan = MultiClipPlan.model_validate_json(
                 json.dumps({
                     "summary": job["analysis"]["summary"],
@@ -1307,19 +1952,31 @@ class LocalJobService:
                     "product_facts": "Preserve visible product details from the supplied references.",
                     "product_references": [],
                     "continuity_references": [],
+                    "hook": self._load_plan(job).hook,
                     "clips": [clip.model_dump(mode="json")],
                 })
             )
             estimate = estimate_multiclip_generation(single_plan, analysis_usd=Decimal("0"))
             if generation_approval_required(estimate) and approved_max_usd is None:
                 raise ConfirmationRequired(estimate.total_usd, "This regeneration needs spending confirmation.")
-            if approved_max_usd is not None and approved_max_usd < estimate.total_usd:
+            if approved_max_usd is not None and not estimate_within_approved_amount(estimate.total_usd, approved_max_usd):
                 raise AppError(f"Estimated total ${estimate.total_usd:.4f} exceeds the approved maximum ${approved_max_usd:.4f}.")
+            self._check_project_spending_limit(job, estimate.image_usd + estimate.video_usd)
             version_number = len(job["clips"][clip_index - 1]["versions"]) + 1
             output_dir = self._job_path(job_id).parent / "outputs" / f"clip-{clip_index:02d}" / f"version-{version_number}"
-            job["status"] = "regenerating_starting_image"
-            job["stage"] = "regenerating_starting_image"
-            job["message"] = f"Preparing a revised starting image for clip {clip_index} (~${IMAGE_1K_USD:.2f})."
+            current_image_id = job["clips"][clip_index - 1].get("current_starting_image_asset")
+            current_image_path = job.get("assets", {}).get(current_image_id, {}).get("path")
+            reuse_approved_image = bool(
+                clip.audio_enabled and job.get("images_approved_at") and current_image_path
+                and Path(current_image_path).is_file()
+            )
+            job["status"] = "generating_clips" if reuse_approved_image else "regenerating_starting_image"
+            job["stage"] = job["status"]
+            job["message"] = (
+                f"Reusing Clip {clip_index}'s approved starting image and preparing its revised video."
+                if reuse_approved_image else
+                f"Preparing a revised starting image for clip {clip_index} (~${IMAGE_1K_USD:.2f})."
+            )
             job["active_clip"] = clip_index
             job["active_stage"] = "regenerating_starting_image"
             job["images_approved_at"] = None
@@ -1328,14 +1985,19 @@ class LocalJobService:
                 "output_dir": str(output_dir), "version": version_number, "image_ready": False,
                 "approved_max_usd": str(approved_max_usd) if approved_max_usd is not None else None,
             }
+            if reuse_approved_image:
+                job["pending_clip_regeneration"].update(image_ready=True, reuse_approved_starting_image=True)
             job["updated_at"] = _now()
             self._save(job)
-        self._spawn(self._prepare_regenerated_clip_image, job_id, clip_index, instructions.strip(), output_dir, False)
+        if reuse_approved_image:
+            self._spawn(self._generate_regenerated_clip, job_id)
+        else:
+            self._spawn(self._prepare_regenerated_clip_image, job_id, clip_index, instructions.strip(), output_dir, False)
         return self.get_job(job_id)
 
     def _prepare_regenerated_clip_image(self, job_id: str, clip_index: int, instructions: str, output_dir: Path, resume: bool) -> None:
         job = self._read(job_id)
-        full_plan = MultiClipPlan.model_validate_json(job["plan_json"])
+        full_plan = self._load_plan(job)
         original = full_plan.clips[clip_index - 1]
         clip = original.model_copy(update={
             "starting_image_prompt": original.starting_image_prompt + f"\nClip-specific revision: {instructions}",
@@ -1343,10 +2005,29 @@ class LocalJobService:
         })
         old_version = job["clips"][clip_index - 1]["versions"][-1]
         old_image = Path(job["assets"][old_version["starting_image_asset"]]["path"])
-        identity_path = self._product_identity_reference_path(job)
-        image_continuity = [identity_path] if identity_path and identity_path != old_image else []
+        planned_clips = {candidate.index: candidate for candidate in full_plan.clips}
+        target_group = original.continuity_group.strip()
+        image_continuity = []
+        continuity_roles = []
+        character_references = self._character_identity_reference_paths(job, full_plan, original)
+        if target_group:
+            peers = []
+            for record in job["clips"]:
+                peer_index = record["index"]
+                asset_id = record.get("current_starting_image_asset")
+                if peer_index == clip_index or peer_index not in planned_clips or not asset_id:
+                    continue
+                if planned_clips[peer_index].continuity_group.strip() != target_group:
+                    continue
+                peer_path = Path(job["assets"][asset_id]["path"])
+                if peer_path.is_file():
+                    peers.append((abs(peer_index - clip_index), peer_index, peer_path))
+            if peers:
+                image_continuity.append(min(peers)[2])
+                continuity_roles.append("same-scene faces/clothes/location; use background")
         if old_image.is_file() and old_image not in image_continuity:
             image_continuity.append(old_image)
+            continuity_roles.append("pose and held objects only; ignore background")
         single_plan = full_plan.model_copy(update={"clips": [clip]})
         client = None
         try:
@@ -1354,7 +2035,9 @@ class LocalJobService:
             image_estimate = estimate_multiclip_generation(single_plan, analysis_usd=Decimal("0"))
             images = run_multiclip_generation(single_plan, [Path(path) for path in full_plan.product_references],
                 image_continuity, output_dir, client, pricing_verified=True, estimate_reliable=True,
-                approved_max_usd=image_estimate.total_usd, resume=resume, images_only=True)
+                approved_max_usd=image_estimate.total_usd, resume=resume, images_only=True,
+                continuity_reference_roles=continuity_roles,
+                character_references=character_references)
         except Exception as exc:
             label = f"clip_{clip_index}_v{job['pending_clip_regeneration']['version']}"
             self._collect_charges(job_id, output_dir, label)
@@ -1377,7 +2060,7 @@ class LocalJobService:
         if not pending or not pending.get("image_ready"):
             self._set_failure(job_id, "The revised starting image is missing; resume image preparation before video generation.")
             return
-        full_plan = MultiClipPlan.model_validate_json(job["plan_json"])
+        full_plan = self._load_plan(job)
         index = int(pending["clip_index"])
         original = full_plan.clips[index - 1]
         instructions = pending["instructions"]
@@ -1414,7 +2097,7 @@ class LocalJobService:
 
     def _regenerate_clip(self, job_id: str, clip_index: int, instructions: str) -> None:
         job = self._read(job_id)
-        full_plan = MultiClipPlan.model_validate_json(job["plan_json"])
+        full_plan = self._load_plan(job)
         original = full_plan.clips[clip_index - 1]
         clip = original.model_copy(update={
             "starting_image_prompt": original.starting_image_prompt + f"\nClip-specific revision: {instructions}",
@@ -1471,6 +2154,21 @@ class LocalJobService:
         }
         clips = []
         for clip in job["clips"]:
+            try:
+                planned = self._load_plan(job).clips[int(clip["index"]) - 1]
+                audio_fields = {
+                    "audio_mode": planned.audio_mode,
+                    "audio_requested": planned.audio_requested,
+                    "audio_enabled": planned.audio_enabled,
+                    "audio_direction": planned.audio_direction,
+                }
+            except (KeyError, IndexError, ValueError):
+                audio_fields = {
+                    "audio_mode": clip.get("audio_mode", "auto"),
+                    "audio_requested": clip.get("audio_requested"),
+                    "audio_enabled": clip.get("audio_enabled", bool(clip.get("preserve_audio", False))),
+                    "audio_direction": clip.get("audio_direction", "No native audio selected for this legacy clip."),
+                }
             versions = []
             for version in clip["versions"]:
                 versions.append({
@@ -1480,6 +2178,9 @@ class LocalJobService:
                     "duration_seconds": version["duration_seconds"],
                     "revision": version["revision"],
                     "actual_kie_usd_equivalent": version["actual_kie_usd_equivalent"],
+                    "audio_mode": version.get("audio_mode", "auto"),
+                    "audio_enabled": version.get("audio_enabled", bool(version.get("audio_present", False))),
+                    "audio_present": version.get("audio_present"),
                 })
             current_asset_id = clip.get("current_starting_image_asset")
             if not current_asset_id and clip.get("versions"):
@@ -1493,8 +2194,19 @@ class LocalJobService:
                             "asset": assets.get(version.get("starting_image_asset"))}
                            for version in clip.get("versions", [])]
             clips.append({key: value for key, value in clip.items() if key not in {"versions", "current_starting_image_asset", "starting_image_history"}} |
-                         {"versions": versions, "current_starting_image": current_image, "starting_image_history": history})
-        inputs = [asset for asset in assets.values() if asset["role"] in {"reference_video", "product_reference"}]
+                         audio_fields | {"versions": versions, "current_starting_image": current_image, "starting_image_history": history})
+        asset_records = job.get("assets", {})
+        reference_id = job.get("reference_asset_id")
+        if not reference_id and job.get("reference_video"):
+            reference_id = next((asset_id for asset_id, item in asset_records.items()
+                                 if item.get("role") == "reference_video" and Path(item.get("path", "")).resolve() == Path(job["reference_video"]).resolve()), None)
+        product_ids = job.get("product_asset_ids")
+        if product_ids is None:
+            product_paths = {Path(path).resolve() for path in job.get("product_references", [])}
+            product_ids = [asset_id for asset_id, item in asset_records.items()
+                           if item.get("role") == "product_reference" and Path(item.get("path", "")).resolve() in product_paths]
+        input_ids = ([reference_id] if reference_id else []) + list(product_ids)
+        inputs = [{"asset_id": asset_id, **assets[asset_id]} for asset_id in input_ids if asset_id in assets]
         reference_filename = next(
             (asset["filename"] for asset in job["assets"].values() if asset["role"] == "reference_video"),
             Path(job["reference_video"]).name if job.get("reference_video") else None,
@@ -1507,25 +2219,84 @@ class LocalJobService:
         video_info.pop("path", None)
         return {
             "id": job["id"], "title": title, "mode": job.get("mode", "reference"), "hook": job.get("hook", "recommend"),
+            "requested_clip_count": job.get("requested_clip_count", 3),
+            "clip_count_selection": job.get("clip_count_selection", "fixed"),
+            "seconds_per_clip": job.get("seconds_per_clip", 5),
+            "duration_selection": job.get("duration_selection", "fixed"),
             "status": job["status"], "stage": job["stage"],
             "message": job["message"], "provider_state": job.get("provider_state"),
             "created_at": job["created_at"], "updated_at": job["updated_at"],
             "reference_video_info": video_info,
             "inputs": inputs, "instructions": job["instructions"],
-            "analysis": ({"summary": analysis["summary"], "questions": analysis["questions"], "shot_count": len(analysis["shots"])} if analysis else None),
+            "analysis": analysis,
             "estimate": job["estimate"], "estimate_reliable": job["estimate_reliable"],
             "spending": self._project_spending(job),
+            "project_spending_limit_usd": str(job.get("project_spending_limit_usd", DEFAULT_PROJECT_SPENDING_LIMIT_USD)),
             "director_questions": job.get("director_questions", []),
             "interview_answers": job.get("interview_answers", []),
             "can_resume": job.get("status") in {"failed", "interrupted"} and bool(job.get("plan_json")) and bool(job.get("clips")),
+            "resume_operation": self._resume_image_retry_info(job),
             "images_approved": bool(job.get("images_approved_at")),
             "review_images_before_video": bool(job.get("review_images_before_video", job.get("status") == "awaiting_image_review")),
             "clip_regeneration_pending": bool(job.get("pending_clip_regeneration")),
+            "scene_base_images": self.scene_base_images(job["id"], job),
             "clips": clips, "charges": job["charges"], "error": job.get("error"),
         }
 
+    def _resume_image_retry_info(self, job: dict) -> dict | None:
+        operation = job.get("resume_operation")
+        if (operation and operation.get("kind") == "starting_image_retry"
+                and job.get("status") not in {"failed", "interrupted"}):
+            return operation
+        if (job.get("status") not in {"failed", "interrupted"}
+                or not job.get("review_images_before_video")
+                or job.get("active_stage") != "preparing_images"):
+            return None
+        output_dir = self._job_path(job["id"]).parent / "outputs" / "initial"
+        try:
+            manifest = json.loads((output_dir / "generation-usage.json").read_text())
+        except (OSError, ValueError, json.JSONDecodeError):
+            return None
+        failed_records = [task for task in manifest.get("tasks", [])
+                          if task.get("kind") == "starting_image" and task.get("status") in {"failed", "fail"}
+                          and task.get("clip_index") is not None]
+        failed = {int(task["clip_index"]) for task in failed_records}
+        missing = [index for index in sorted(failed)
+                   if not any(output_dir.glob(f"clip-{index:02d}-*-starting.png"))]
+        if not missing or any(index not in {clip.get("index") for clip in job.get("clips", [])} for index in missing):
+            return None
+        estimate = IMAGE_1K_USD * len(missing)
+        clips_text = ", ".join(f"Clip {index}" for index in missing)
+        label = f"Retry {clips_text} image" if len(missing) == 1 else f"Retry {len(missing)} missing images"
+        latest_failure = next((task for task in reversed(failed_records) if int(task["clip_index"]) in missing), {})
+        task_id = latest_failure.get("task_id")
+        raw_credits = latest_failure.get("credits_consumed")
+        usage_detail = f"The failed task reported {raw_credits} Kie credits; invoice usage is not verified." if raw_credits is not None else "The failed task's charge is unreported."
+        provider_failure = latest_failure.get("provider_failure") or {}
+        provider_code = provider_failure.get("code")
+        provider_message = provider_failure.get("message")
+        provider_detail = "; ".join(
+            part for part in (
+                f"code {provider_code}" if provider_code not in (None, "") else "",
+                str(provider_message) if provider_message else "",
+            ) if part
+        )
+        state_detail = latest_failure.get("provider_state", "unknown")
+        failure_detail = (
+            f"Failed task {task_id} ({state_detail} state"
+            f"{'; ' + provider_detail if provider_detail else ''}). "
+            if task_id else "The previous provider task failed. "
+        )
+        return {
+            "kind": "starting_image_retry", "clip_indices": missing,
+            "estimated_usd": f"{estimate:.4f}", "label": label,
+            "description": f"{failure_detail}{usage_detail} Retry only the missing starting image for {clips_text}; saved images for other clips will be reused. Estimated new task cost: ${estimate:.2f}.",
+        }
+
     def get_job(self, job_id: str) -> dict:
-        return self._public_job(self._read(job_id))
+        public = self._public_job(self._read(job_id))
+        public["storage_bytes"] = self._project_size(self._job_path(job_id).parent)
+        return public
 
     def rename_project(self, job_id: str, title: str) -> dict:
         if not isinstance(title, str):
@@ -1538,48 +2309,281 @@ class LocalJobService:
         updated = self._update(job_id, lambda job: job.update(title=normalized))
         return self._public_job(updated)
 
-    def delete_project(self, job_id: str) -> dict:
-        """Delete one inactive job directory without following project symlinks."""
-        job_path = self._job_path(job_id)  # Validate the identifier before touching the filesystem.
-        with self.lock:
+    def _verified_jobs_root(self) -> Path:
+        data_root = self.data_dir.resolve(strict=True)
+        if self.jobs_dir.is_symlink():
+            raise ProjectStorageError("Project storage is not a safe local directory; nothing was deleted.")
+        jobs_root = self.jobs_dir.resolve(strict=True)
+        if jobs_root.parent != data_root or not jobs_root.is_dir():
+            raise ProjectStorageError("Project storage is not a safe local directory; nothing was deleted.")
+        return jobs_root
+
+    @staticmethod
+    def _project_files(root: Path, *, reject_symlinks: bool = False) -> list[Path]:
+        files = []
+        for current, directories, names in os.walk(root, followlinks=False):
+            current_path = Path(current)
+            for name in list(directories):
+                path = current_path / name
+                if path.is_symlink():
+                    if reject_symlinks:
+                        raise ProjectStorageError("Project contains a symbolic link; nothing was deleted.")
+                    continue
+            for name in names:
+                path = current_path / name
+                if path.is_symlink():
+                    if reject_symlinks:
+                        raise ProjectStorageError("Project contains a symbolic link; nothing was deleted.")
+                    continue
+                if path.is_file():
+                    try:
+                        resolved = path.resolve(strict=True)
+                    except FileNotFoundError:
+                        # Atomic JSON writes can replace a temporary file between
+                        # the directory scan and this check. It is no longer a
+                        # managed file to count or delete.
+                        continue
+                    if root not in resolved.parents:
+                        raise ProjectStorageError("Project files are outside the project storage directory; nothing was deleted.")
+                    files.append(path)
+        return files
+
+    def _referenced_paths(self, exclude_ids: set[str] | None = None) -> set[Path]:
+        references: set[Path] = set()
+        exclude_ids = exclude_ids or set()
+        for record in self.jobs_dir.glob("*/job.json"):
+            if (record.parent.name in exclude_ids or record.parent.is_symlink() or record.is_symlink()
+                    or record.parent.resolve().parent != self.jobs_dir.resolve()):
+                continue
             try:
-                data_root = self.data_dir.resolve(strict=True)
-                if self.jobs_dir.is_symlink():
-                    raise ProjectStorageError("Project storage is not a safe local directory; nothing was deleted.")
-                jobs_root = self.jobs_dir.resolve(strict=True)
-                if jobs_root.parent != data_root or not jobs_root.is_dir():
-                    raise ProjectStorageError("Project storage is not a safe local directory; nothing was deleted.")
+                job = json.loads(record.read_text())
+            except (OSError, ValueError, json.JSONDecodeError):
+                raise ProjectStorageError("Another project's files could not be verified; nothing was deleted.")
+            candidates = [asset.get("path") for asset in job.get("assets", {}).values() if isinstance(asset, dict)]
+            candidates += [job.get("reference_video"), *job.get("product_references", [])]
+            for value in candidates:
+                if isinstance(value, str) and value:
+                    try:
+                        references.add(Path(value).resolve())
+                    except OSError:
+                        continue
+        return references
 
-                project_root = job_path.parent
-                if project_root.is_symlink() or not project_root.is_dir():
-                    raise JobNotFound("Project not found")
-                resolved_project_root = project_root.resolve(strict=True)
-                if resolved_project_root.parent != jobs_root:
-                    raise ProjectStorageError("Project files are outside the project storage directory; nothing was deleted.")
-                if job_path.is_symlink() or not job_path.is_file():
-                    raise JobNotFound("Project not found")
-                if job_path.resolve(strict=True).parent != resolved_project_root:
-                    raise ProjectStorageError("Project data is outside its project directory; nothing was deleted.")
-
+    @staticmethod
+    def _job_asset_paths(job: dict) -> set[Path]:
+        values = [asset.get("path") for asset in job.get("assets", {}).values() if isinstance(asset, dict)]
+        values += [job.get("reference_video"), *job.get("product_references", [])]
+        paths = set()
+        for value in values:
+            if isinstance(value, str) and value:
                 try:
-                    job = json.loads(job_path.read_text())
-                except (OSError, ValueError, json.JSONDecodeError) as exc:
-                    raise ProjectStorageError("Project data could not be verified; nothing was deleted.") from exc
-                if job.get("status") in DELETION_BLOCKED_STATUSES:
-                    raise JobConflict("Cannot delete a project while work is active. Wait for it to finish first.")
+                    paths.add(Path(value).resolve())
+                except OSError:
+                    continue
+        return paths
 
-                shutil.rmtree(resolved_project_root)
-            except (JobNotFound, JobConflict, ProjectStorageError):
-                raise
-            except OSError as exc:
-                raise ProjectStorageError("Project files could not be deleted. Check local storage and try again.") from exc
-        return {"id": job_id, "deleted": True}
+    def _project_size(self, root: Path, protected: set[Path] | None = None) -> int:
+        protected = protected or set()
+        try:
+            jobs_root = self._verified_jobs_root()
+            if root.is_symlink() or root.resolve(strict=True).parent != jobs_root:
+                return 0
+        except (OSError, ProjectStorageError):
+            return 0
+        total = 0
+        inodes = set()
+        for path in self._project_files(root):
+            try:
+                resolved = path.resolve(strict=True)
+                if resolved in protected:
+                    continue
+                info = path.stat(follow_symlinks=False)
+            except OSError:
+                # Atomic job saves can replace a temporary file while usage is measured.
+                continue
+            inode = (info.st_dev, info.st_ino)
+            if inode not in inodes:
+                total += info.st_size
+                inodes.add(inode)
+        return total
+
+    def _delete_projects_locked(self, job_ids: list[str]) -> dict:
+        ids = list(dict.fromkeys(job_ids))
+        if not ids:
+            raise AppError("Select at least one project to delete.")
+        jobs_root = self._verified_jobs_root()
+        projects = []
+        selected_asset_paths: set[Path] = set()
+        for job_id in ids:
+            job_path = self._job_path(job_id)
+            root = job_path.parent
+            if root.is_symlink() or not root.is_dir():
+                raise JobNotFound("Project not found")
+            resolved_root = root.resolve(strict=True)
+            if resolved_root.parent != jobs_root or job_path.is_symlink() or not job_path.is_file() or job_path.resolve(strict=True).parent != resolved_root:
+                raise ProjectStorageError("Project data is outside its project directory; nothing was deleted.")
+            try:
+                job = json.loads(job_path.read_text())
+            except (OSError, ValueError, json.JSONDecodeError) as exc:
+                raise ProjectStorageError("Project data could not be verified; nothing was deleted.") from exc
+            if job.get("status") in DELETION_BLOCKED_STATUSES:
+                raise JobConflict("Cannot delete a project while work is active. Wait for it to finish first.")
+            selected_asset_paths.update(self._job_asset_paths(job))
+            files = self._project_files(resolved_root, reject_symlinks=True)
+            projects.append((job_id, resolved_root, files))
+
+        protected = self._referenced_paths(set(ids))
+        recovered = sum(self._project_size(root, protected) for _, root, _ in projects)
+        project_roots = [root.resolve() for _, root, _ in projects]
+        reclaimable_shared = []
+        for path in selected_asset_paths - protected:
+            try:
+                if jobs_root not in path.parents or any(root == path or root in path.parents for root in project_roots):
+                    continue
+                if path.is_symlink() or not path.is_file():
+                    continue
+                reclaimable_shared.append(path)
+            except OSError:
+                continue
+        recovered += sum(path.stat(follow_symlinks=False).st_size for path in reclaimable_shared)
+        try:
+            for _, root, files in projects:
+                shared = [path for path in files if path.resolve() in protected]
+                if not shared:
+                    shutil.rmtree(root)
+                    continue
+                # Preserve shared files in place; remove only this project's own files.
+                for path in files:
+                    if path.resolve() not in protected:
+                        path.unlink()
+                for current, directories, _ in os.walk(root, topdown=False, followlinks=False):
+                    for directory in directories:
+                        try:
+                            (Path(current) / directory).rmdir()
+                        except OSError:
+                            pass
+                try:
+                    root.rmdir()
+                except OSError:
+                    # A shared file remains at its original managed path for its consumers.
+                    pass
+            for path in reclaimable_shared:
+                try:
+                    path.unlink()
+                except FileNotFoundError:
+                    pass
+        except OSError as exc:
+            raise ProjectStorageError("Project files could not be deleted. Check local storage and try again.") from exc
+        return {"deleted_count": len(ids), "deleted_ids": ids, "recovered_bytes": recovered}
+
+    def delete_project(self, job_id: str) -> dict:
+        """Delete one inactive project while preserving any assets another project references."""
+        self._job_path(job_id)
+        with self.lock:
+            result = self._delete_projects_locked([job_id])
+        return {"id": job_id, "deleted": True, "recovered_bytes": result["recovered_bytes"]}
+
+    def delete_projects(self, job_ids: list[str]) -> dict:
+        if not isinstance(job_ids, list) or any(not isinstance(job_id, str) for job_id in job_ids):
+            raise AppError("Choose valid projects to delete.")
+        with self.lock:
+            return self._delete_projects_locked(job_ids)
+
+    def estimate_deletion(self, job_ids: list[str]) -> dict:
+        if not isinstance(job_ids, list) or not job_ids or any(not isinstance(job_id, str) for job_id in job_ids):
+            raise AppError("Select at least one project.")
+        with self.lock:
+            jobs_root = self._verified_jobs_root()
+            roots = []
+            for job_id in dict.fromkeys(job_ids):
+                job_path = self._job_path(job_id)
+                root = job_path.parent
+                if root.is_symlink() or not root.is_dir() or root.resolve(strict=True).parent != jobs_root:
+                    raise JobNotFound("Project not found")
+                roots.append(root.resolve(strict=True))
+            protected = self._referenced_paths(set(job_ids))
+            own_bytes = sum(self._project_size(root, protected) for root in roots)
+            selected_paths = set()
+            for job_id in dict.fromkeys(job_ids):
+                try:
+                    selected_paths.update(self._job_asset_paths(json.loads(self._job_path(job_id).read_text())))
+                except (OSError, ValueError, json.JSONDecodeError):
+                    raise ProjectStorageError("Project data could not be verified; nothing was deleted.")
+            additional = 0
+            for path in selected_paths - protected:
+                try:
+                    if (jobs_root not in path.parents or any(root == path or root in path.parents for root in roots)
+                            or path.is_symlink() or not path.is_file()):
+                        continue
+                    additional += path.stat(follow_symlinks=False).st_size
+                except OSError:
+                    continue
+            return {"project_count": len(roots), "recoverable_bytes": own_bytes + additional}
+
+    def storage_summary(self) -> dict:
+        jobs = self.list_jobs()
+        total = 0
+        seen = set()
+        try:
+            self._verified_jobs_root()
+            for path in self.jobs_dir.rglob("*"):
+                if path.is_symlink() or not path.is_file():
+                    continue
+                stat = path.stat(follow_symlinks=False)
+                inode = (stat.st_dev, stat.st_ino)
+                if inode not in seen:
+                    total += stat.st_size
+                    seen.add(inode)
+        except OSError:
+            pass
+        return {"project_count": len(jobs), "total_bytes": total}
+
+    def cleanup_temporary_files(self, now: float | None = None) -> dict:
+        """Remove only old, unreferenced transient files under managed job storage."""
+        threshold = (now if now is not None else __import__("time").time()) - 48 * 60 * 60
+        removed = 0
+        recovered = 0
+        suffixes = {".tmp", ".part", ".partial", ".download"}
+        try:
+            self._verified_jobs_root()
+            active = {path.parent.name for path in self.jobs_dir.glob("*/job.json")
+                      if not path.is_symlink() and self._status_for_path(path) in DELETION_BLOCKED_STATUSES}
+            references = self._referenced_paths()
+            for root in self.jobs_dir.iterdir():
+                if root.is_symlink() or not root.is_dir() or root.name in active:
+                    continue
+                for current, directories, names in os.walk(root, followlinks=False):
+                    directories[:] = [name for name in directories if not (Path(current) / name).is_symlink()]
+                    for name in names:
+                        path = Path(current) / name
+                        if path.suffix.lower() not in suffixes or path.is_symlink() or not path.is_file():
+                            continue
+                        try:
+                            if path.stat(follow_symlinks=False).st_mtime > threshold or path.resolve() in references:
+                                continue
+                            size = path.stat(follow_symlinks=False).st_size
+                            path.unlink()
+                            removed += 1
+                            recovered += size
+                        except OSError:
+                            continue
+        except (OSError, ProjectStorageError):
+            return {"removed_count": removed, "recovered_bytes": recovered}
+        return {"removed_count": removed, "recovered_bytes": recovered}
+
+    def _status_for_path(self, path: Path) -> str | None:
+        try:
+            return json.loads(path.read_text()).get("status")
+        except (OSError, ValueError, json.JSONDecodeError):
+            return None
 
     def list_jobs(self) -> list[dict]:
         jobs = []
         for path in self.jobs_dir.glob("*/job.json"):
             try:
-                jobs.append(self._public_job(json.loads(path.read_text())))
+                public = self._public_job(json.loads(path.read_text()))
+                public["storage_bytes"] = self._project_size(path.parent)
+                jobs.append(public)
             except (OSError, ValueError, KeyError, json.JSONDecodeError):
                 continue
         return sorted(jobs, key=lambda item: item["updated_at"], reverse=True)
@@ -1684,12 +2688,22 @@ def make_handler(service: LocalJobService) -> type[BaseHTTPRequestHandler]:
                 if pieces == ["api", "health"]:
                     self._json(HTTPStatus.OK, {"status": "ok", "host": "localhost"})
                 elif pieces == ["api", "jobs"]:
-                    self._json(HTTPStatus.OK, {"jobs": service.list_jobs()})
+                    self._json(HTTPStatus.OK, {"jobs": service.list_jobs(), "storage": service.storage_summary()})
                 elif len(pieces) == 3 and pieces[:2] == ["api", "jobs"]:
                     self._json(HTTPStatus.OK, service.get_job(pieces[2]))
                 elif len(pieces) == 5 and pieces[:2] == ["api", "jobs"] and pieces[3] == "assets":
                     download = parse_qs(parsed.query).get("download") == ["1"]
                     self._asset(pieces[2], pieces[4], download=download)
+                elif len(pieces) == 6 and pieces[:2] == ["api", "jobs"] and pieces[3] == "scene-references":
+                    file_path, media_type, _ = service.get_scene_reference(pieces[2], int(pieces[4]), int(pieces[5]))
+                    data = file_path.read_bytes()
+                    self.send_response(HTTPStatus.OK)
+                    self.send_header("Content-Type", media_type)
+                    self.send_header("Content-Length", str(len(data)))
+                    self.send_header("X-Content-Type-Options", "nosniff")
+                    self.send_header("Cache-Control", "private, no-store")
+                    self.end_headers()
+                    self.wfile.write(data)
                 else:
                     self._json(HTTPStatus.NOT_FOUND, {"error": "Not found."})
             except Exception as exc:
@@ -1705,7 +2719,7 @@ def make_handler(service: LocalJobService) -> type[BaseHTTPRequestHandler]:
                 if path == ["api", "jobs"]:
                     fields, files = _parse_multipart(self.headers.get("Content-Type", ""), body)
                     if fields.get("mode") == "original":
-                        review_images = fields.get("review_images_before_video", "false").lower() in {"1", "true", "on"}
+                        review_images = fields.get("review_images_before_video", "true").lower() in {"1", "true", "on"}
                         result = service.create_original_job(fields.get("instructions", ""), fields.get("hook", "recommend"), int(fields.get("clip_count", "3")), int(fields.get("seconds_per_clip", "5")), files.get("product_images", []), review_images)
                         self._json(HTTPStatus.ACCEPTED, result)
                         return
@@ -1717,7 +2731,31 @@ def make_handler(service: LocalJobService) -> type[BaseHTTPRequestHandler]:
                         fields.get("instructions", ""),
                         int(fields.get("clip_count", "3")),
                         int(fields.get("seconds_per_clip", "5")),
-                        fields.get("review_images_before_video", "false").lower() in {"1", "true", "on"},
+                        fields.get("review_images_before_video", "true").lower() in {"1", "true", "on"},
+                        fields.get("hook", "recommend"),
+                    )
+                    self._json(HTTPStatus.ACCEPTED, result)
+                    return
+                if path == ["api", "drafts"]:
+                    fields, files = _parse_multipart(self.headers.get("Content-Type", ""), body)
+                    self._json(HTTPStatus.OK, service.save_draft(fields, files))
+                    return
+                if len(path) == 4 and path[:2] == ["api", "jobs"] and path[3] == "draft":
+                    fields, files = _parse_multipart(self.headers.get("Content-Type", ""), body)
+                    self._json(HTTPStatus.OK, service.save_draft(fields, files, path[2]))
+                    return
+                if (len(path) == 7 and path[:2] == ["api", "jobs"] and path[3] == "clips"
+                        and path[5:] == ["starting-image", "regenerate"]
+                        and self.headers.get("Content-Type", "").lower().startswith("multipart/form-data")):
+                    fields, files = _parse_multipart(self.headers.get("Content-Type", ""), body)
+                    approved = Decimal(fields["approved_max_usd"]) if fields.get("approved_max_usd") else None
+                    masks = files.get("mask_image", [])
+                    if len(masks) > 1:
+                        raise AppError("Upload one edit mask at a time.")
+                    result = service.regenerate_starting_image(
+                        path[2], int(path[4]), fields.get("instructions", ""), approved,
+                        masked_edit=fields.get("edit_mode") == "masked",
+                        base_source=fields.get("base_source"), mask_upload=masks[0] if masks else None,
                     )
                     self._json(HTTPStatus.ACCEPTED, result)
                     return
@@ -1727,6 +2765,16 @@ def make_handler(service: LocalJobService) -> type[BaseHTTPRequestHandler]:
                     return
                 if len(path) == 4 and path[:2] == ["api", "jobs"] and path[3] == "delete":
                     self._json(HTTPStatus.OK, service.delete_project(path[2]))
+                    return
+                if path == ["api", "jobs", "delete-bulk"]:
+                    self._json(HTTPStatus.OK, service.delete_projects(payload.get("job_ids")))
+                    return
+                if path == ["api", "jobs", "delete-estimate"]:
+                    self._json(HTTPStatus.OK, service.estimate_deletion(payload.get("job_ids")))
+                    return
+                if len(path) == 4 and path[:2] == ["api", "jobs"] and path[3] == "review-images":
+                    enabled = payload.get("enabled")
+                    self._json(HTTPStatus.OK, service.set_review_images_before_video(path[2], enabled))
                     return
                 if len(path) == 4 and path[:2] == ["api", "jobs"] and path[3] == "answer":
                     self._json(HTTPStatus.ACCEPTED, service.answer_original_interview(path[2], payload.get("answer", "")))
@@ -1739,12 +2787,19 @@ def make_handler(service: LocalJobService) -> type[BaseHTTPRequestHandler]:
                     review_images = payload.get("review_images")
                     self._json(HTTPStatus.ACCEPTED, service.start_generation(path[2], approved, resume=bool(payload.get("resume")), review_images=bool(review_images) if review_images is not None else None))
                     return
+                if len(path) == 4 and path[:2] == ["api", "jobs"] and path[3] == "analyze":
+                    self._json(HTTPStatus.ACCEPTED, service.analyze_draft(path[2]))
+                    return
                 if len(path) == 4 and path[:2] == ["api", "jobs"] and path[3] == "approve-images":
-                    self._json(HTTPStatus.ACCEPTED, service.approve_starting_images(path[2]))
+                    approved = Decimal(str(payload["approved_max_usd"])) if payload.get("approved_max_usd") is not None else None
+                    self._json(HTTPStatus.ACCEPTED, service.approve_starting_images(path[2], approved))
                     return
                 if len(path) == 6 and path[:2] == ["api", "jobs"] and path[3] == "clips" and path[5] == "regenerate":
                     approved = Decimal(str(payload["approved_max_usd"])) if payload.get("approved_max_usd") is not None else None
                     self._json(HTTPStatus.ACCEPTED, service.start_regeneration(path[2], int(path[4]), payload.get("instructions", ""), approved))
+                    return
+                if len(path) == 6 and path[:2] == ["api", "jobs"] and path[3] == "clips" and path[5] == "audio":
+                    self._json(HTTPStatus.OK, service.set_clip_audio_mode(path[2], int(path[4]), payload.get("mode")))
                     return
                 if len(path) == 7 and path[:2] == ["api", "jobs"] and path[3] == "clips" and path[5:] == ["starting-image", "regenerate"]:
                     approved = Decimal(str(payload["approved_max_usd"])) if payload.get("approved_max_usd") is not None else None
