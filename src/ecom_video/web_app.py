@@ -29,6 +29,7 @@ from ecom_video.costs import (
     estimate_within_approved_amount,
     reserve_estimate_usd,
 )
+from ecom_video.automatic_mask import AutomaticMaskError, extract_edit_target, generate_automatic_mask
 from ecom_video.media import probe_video, sample_frames
 from ecom_video.models import AnalysisResult, AudioMode
 from ecom_video.providers.kie import KieClient
@@ -39,6 +40,7 @@ from ecom_video.workflow import (
     MAX_CREATIVE_INSTRUCTIONS,
     PlannedClip,
     build_multiclip_plan,
+    compile_video_prompt,
     creative_instruction_length,
     estimate_multiclip_generation,
     fit_reference_analysis_to_clip_count,
@@ -354,7 +356,7 @@ class LocalJobService:
             raise AppError("Choose a supported creative hook.")
         instructions = fields.get("instructions", "")
         if creative_instruction_length(instructions) > MAX_CREATIVE_INSTRUCTIONS:
-            raise AppError("Keep creative instructions to 20,000 characters or fewer.")
+            raise AppError(f"Keep creative instructions to {MAX_CREATIVE_INSTRUCTIONS:,} characters or fewer.")
         count_mode, duration_mode, clip_count, seconds = self._draft_selection(fields)
         review = fields.get("review_images_before_video", "true").lower() in {"1", "true", "on"}
         video_files = files.get("reference_video", [])
@@ -508,7 +510,7 @@ class LocalJobService:
         if not instructions.strip():
             raise AppError("Add creative instructions before analyzing the reference.")
         if creative_instruction_length(instructions) > MAX_CREATIVE_INSTRUCTIONS:
-            raise AppError("Keep creative instructions to 20,000 characters or fewer.")
+            raise AppError(f"Keep creative instructions to {MAX_CREATIVE_INSTRUCTIONS:,} characters or fewer.")
         if clip_count < 1 or clip_count > 12 or seconds_per_clip < 1 or seconds_per_clip > 15:
             raise AppError("Choose 1–12 clips and 1–15 seconds per clip.")
         validated_images: list[tuple[str, bytes, str]] = []
@@ -574,7 +576,7 @@ class LocalJobService:
 
     def create_original_job(self, instructions: str, hook: str = "recommend", clip_count: int = 3, seconds_per_clip: int = 5, product_images: list[tuple[str, bytes]] | None = None, review_images_before_video: bool = DEFAULT_REVIEW_IMAGES_BEFORE_VIDEO) -> dict:
         if not instructions.strip() or creative_instruction_length(instructions) > MAX_CREATIVE_INSTRUCTIONS:
-            raise AppError("Describe your original video idea in 1–20,000 characters.")
+            raise AppError(f"Describe your original video idea in 1–{MAX_CREATIVE_INSTRUCTIONS:,} characters.")
         if hook not in {"recommend", "in_store_reaction", "wet_works", "countdown_reveal", "gifting", "versus", "custom"}:
             raise AppError("Choose a supported creative hook.")
         if not 1 <= clip_count <= 12 or not 1 <= seconds_per_clip <= 15:
@@ -650,7 +652,7 @@ class LocalJobService:
 
     def answer_original_interview(self, job_id: str, answer: str) -> dict:
         if not answer.strip() or creative_instruction_length(answer) > MAX_CREATIVE_INSTRUCTIONS:
-            raise AppError("Enter an answer of 1–20,000 characters.")
+            raise AppError(f"Enter an answer of 1–{MAX_CREATIVE_INSTRUCTIONS:,} characters.")
         with self.lock:
             job = self._read(job_id)
             if job.get("mode") != "original" or job["status"] != "interviewing":
@@ -663,15 +665,27 @@ class LocalJobService:
         self._spawn(self._director_turn, job_id)
         return self.get_job(job_id)
 
-    def refine_plan(self, job_id: str, instruction: str) -> dict:
+    def refine_plan(self, job_id: str, instruction: str, *, updated_creative_direction: str | None = None) -> dict:
         if not instruction.strip() or creative_instruction_length(instruction) > MAX_CREATIVE_INSTRUCTIONS:
-            raise AppError("Describe the plan change in 1–20,000 characters.")
+            raise AppError(f"Describe the plan change in 1–{MAX_CREATIVE_INSTRUCTIONS:,} characters.")
+        if updated_creative_direction is not None and creative_instruction_length(updated_creative_direction) > MAX_CREATIVE_INSTRUCTIONS:
+            raise AppError(f"Keep creative instructions to {MAX_CREATIVE_INSTRUCTIONS:,} characters or fewer.")
         revision_attempted = False
         revision_returned = False
+        original_status = "ready"
         with self.lock:
             job = self._read(job_id)
-            if job["status"] != "ready" or not job.get("plan_json"):
+            direction_edit = updated_creative_direction is not None
+            if direction_edit:
+                if job["status"] not in {"ready", "awaiting_image_review", "completed", "failed", "interrupted"} or not job.get("plan_json"):
+                    raise JobConflict("Creative Direction can be edited when the project is ready for review.")
+                if updated_creative_direction == job.get("instructions", ""):
+                    result = self._public_job(job)
+                    result["creative_direction_revision"] = job.get("creative_direction_revision") or {"affected_clip_indices": []}
+                    return result
+            elif job["status"] != "ready" or not job.get("plan_json"):
                 raise JobConflict("The plan can only be refined before generation while the job is ready.")
+            original_status = job["status"]
             self._check_project_spending_limit(job, ANALYSIS_ALLOWANCE_USD)
             current_plan = self._load_plan(job)
             current_analysis = AnalysisResult.model_validate(job["analysis"])
@@ -682,6 +696,13 @@ class LocalJobService:
                 "confirmed_product_facts": current_plan.product_facts + "\nInterview answers: " + "\n".join(job.get("interview_answers", [])),
                 "analysis_summary": current_analysis.summary,
             }
+            if direction_edit:
+                context["updated_creative_direction"] = updated_creative_direction
+                instruction = (
+                    "Reconcile the current Creative Plan with the complete updated Creative Direction in confirmed context. "
+                    "Compare it with original_instructions, change only affected clips, and preserve all other approved plan details. "
+                    "Do not regenerate media."
+                )
             # Reserve this job while the model revises so concurrent edits or generation cannot race it.
             job["status"] = "refining_plan"
             job["stage"] = "refining_plan"
@@ -699,6 +720,12 @@ class LocalJobService:
                 raise AppError("The revised plan did not preserve the existing shot list.")
             revised_by_id = {shot.index: shot for shot in returned.shots}
             old_shots = {shot.index: shot for shot in current_analysis.shots}
+            for shot_index in changed:
+                original = old_shots[shot_index]
+                revised_by_id[shot_index] = revised_by_id[shot_index].model_copy(update={
+                    "source_observation": original.source_observation,
+                    "applied_user_changes": list(dict.fromkeys([*original.applied_user_changes, instruction.strip()])),
+                })
             merged_analysis = current_analysis.model_copy(update={"summary": revision["summary"], "shots": [revised_by_id.get(shot.index, shot) if shot.index in changed else shot for shot in current_analysis.shots]})
             planned_analysis = merged_analysis.model_copy(update={
                 "shots": [revised_by_id[clip.source_shot_index] if clip.source_shot_index in changed else old_shots[clip.source_shot_index] for clip in current_plan.clips],
@@ -708,6 +735,7 @@ class LocalJobService:
                 current_plan.environment, len(current_plan.clips), current_plan.clips[0].duration_seconds,
                 product_references=[Path(path) for path in current_plan.product_references],
                 continuity_references=[Path(path) for path in current_plan.continuity_references],
+                hook=current_plan.hook,
             )
             # Keep duration, source mapping, and unrequested shot prompts exactly when those shots were not changed.
             new_clips = []
@@ -723,6 +751,8 @@ class LocalJobService:
                         "audio_mode": old.audio_mode,
                     }))
             new_plan = current_plan.model_copy(update={"summary": revision["summary"], "clips": new_clips})
+            if direction_edit:
+                new_plan = new_plan.model_copy(update={"instructions": updated_creative_direction})
             usage = getattr(self.plan_reviser, "last_usage", {}) or {}
             cost = price_openai_analysis_usage(usage)
             reliable = cost is not None
@@ -736,11 +766,29 @@ class LocalJobService:
                 data["estimate_reliable"] = bool(data.get("estimate_reliable", True) and reliable)
                 data["analysis"] = merged_analysis.model_dump(mode="json")
                 data["plan_json"] = new_plan.model_dump_json()
+                if direction_edit:
+                    data["instructions"] = updated_creative_direction
+                    previous_revision = data.get("creative_direction_revision", {})
+                    data["creative_direction_revision"] = {
+                        "revision": int(previous_revision.get("revision", 0)) + 1,
+                        "updated_at": _now(),
+                        "affected_clip_indices": sorted(
+                            clip.index for clip in current_plan.clips if clip.source_shot_index in changed
+                        ),
+                    }
                 edit_total = sum(clip.edit_duration_seconds or 0 for clip in new_clips)
                 data["estimate"] = {"analysis_usd": data["charges"]["analysis_usd"], "images_usd": f"{estimate.image_usd:.4f}", "video_usd": f"{estimate.video_usd:.4f}", "total_usd": f"{estimate.total_usd:.4f}", "clip_count": len(new_clips), "seconds_per_clip": new_clips[0].duration_seconds, "total_video_seconds": estimate.generated_seconds, "intended_edit_seconds": edit_total or None}
                 for clip, planned in zip(data["clips"], new_clips):
                     clip.update(title=planned.title, creative_role=planned.creative_role, action=planned.action, camera=planned.camera, duration_seconds=planned.duration_seconds, edit_duration_seconds=planned.edit_duration_seconds, audio_mode=planned.audio_mode, audio_requested=planned.audio_requested, audio_enabled=planned.audio_enabled, audio_direction=planned.audio_direction)
-                data.update(status="ready", stage="ready", message="Creative plan updated. Review the clips and estimate before generation.", error=None)
+                message = (
+                    "Creative Direction saved. Affected clips: " + (
+                        ", ".join(map(str, sorted(clip.index for clip in current_plan.clips if clip.source_shot_index in changed)))
+                        if changed else "none"
+                    ) + ". Existing media was preserved."
+                    if direction_edit else
+                    "Creative plan updated. Review the clips and estimate before generation."
+                )
+                data.update(status=original_status, stage=original_status, message=message, error=None)
             return self._public_job(self._update(job_id, finish))
         except Exception as exc:
             if revision_attempted:
@@ -749,7 +797,7 @@ class LocalJobService:
                     self._record_openai_cost(job_id, "plan_revision", revision_cost)
                 else:
                     self._record_unknown_openai_operation(job_id, "plan_revision")
-            self._update(job_id, lambda data: data.update(status="ready", stage="ready", message="Plan update failed; the previous plan is preserved.", error=str(exc)))
+            self._update(job_id, lambda data: data.update(status=original_status, stage=original_status, message="Plan update failed; the previous plan is preserved.", error=str(exc)))
             raise
 
     def _director_turn(self, job_id: str) -> None:
@@ -873,9 +921,12 @@ class LocalJobService:
             if not analysis.shots:
                 raise AppError("The reference analysis did not identify any usable shots.")
 
-            clip_count = min(job["requested_clip_count"], len(analysis.shots))
             selected_hook = job.get("hook") or ("in_store_reaction" if re.search(r"\b(?:in[- ]store reaction|wet works)\b", job["instructions"], re.I) else "recommend")
-            if selected_hook in {"in_store_reaction", "wet_works"}:
+            preserve_reference_scenes = job.get("mode") == "reference" and selected_hook in {"in_store_reaction", "wet_works", "countdown_reveal", "gifting"}
+            clip_count = len(analysis.shots) if preserve_reference_scenes else min(job["requested_clip_count"], len(analysis.shots))
+            if preserve_reference_scenes:
+                plan_analysis = analysis.model_copy(deep=True)
+            elif selected_hook in {"in_store_reaction", "wet_works"}:
                 plan_analysis = fit_reference_analysis_to_clip_count(
                     analysis, clip_count, hook=selected_hook, seconds_per_clip=job["seconds_per_clip"],
                 )
@@ -996,6 +1047,17 @@ class LocalJobService:
         analysis_cost = Decimal(job.get("charges", {}).get("analysis_usd", "0"))
         return estimate_multiclip_generation(plan, analysis_usd=analysis_cost)
 
+    def _has_approved_current_clip_image(self, job: dict, clip_index: int) -> bool:
+        clip = job.get("clips", [])[clip_index - 1]
+        asset_id = clip.get("current_starting_image_asset")
+        path = Path(job.get("assets", {}).get(asset_id, {}).get("path", ""))
+        if not asset_id or not path.is_file():
+            return False
+        return bool(job.get("images_approved_at") or any(
+            version.get("starting_image_asset") == asset_id
+            for version in clip.get("versions", [])
+        ))
+
     def _video_operation(self, job: dict) -> tuple[str, Decimal]:
         plan = self._load_plan(job)
         image_ids = [clip.get("current_starting_image_asset") for clip in sorted(job.get("clips", []), key=lambda item: item.get("index", 0))]
@@ -1039,22 +1101,43 @@ class LocalJobService:
             retry_image_info = self._resume_image_retry_info(job) if recoverable else None
             pending_image_regen = job.get("pending_starting_image_regen") if recoverable else None
             pending_clip_regen = job.get("pending_clip_regeneration") if recoverable else None
+            pending_clip_image_reusable = bool(
+                pending_clip_regen and pending_clip_regen.get("image_ready")
+                and pending_clip_regen.get("reuse_approved_starting_image")
+                and self._has_approved_current_clip_image(job, int(pending_clip_regen["clip_index"]))
+            )
             estimate = self._estimate(job)
             saved_images_ready = bool(job.get("clips")) and all(
                 clip.get("current_starting_image_asset") and
                 Path(job.get("assets", {}).get(clip["current_starting_image_asset"], {}).get("path", "")).is_file()
                 for clip in job.get("clips", [])
             )
-            videos_ready = (bool(job.get("images_approved_at")) or
+            videos_ready = (bool(job.get("images_approved_at")) or pending_clip_image_reusable or
                             (recoverable and not job.get("review_images_before_video", False) and saved_images_ready)) and not pending_image_regen
+            if videos_ready:
+                plan = self._load_plan(job)
+                product_reference_count = (
+                    min(6, len(plan.product_references))
+                    if plan.hook in {"in_store_reaction", "wet_works", "countdown_reveal"} else 0
+                )
+                for clip in plan.clips:
+                    candidate = clip
+                    if pending_clip_regen and clip.index == int(pending_clip_regen["clip_index"]):
+                        candidate = clip.model_copy(update={
+                            "video_prompt": clip.video_prompt + "\nClip-specific revision: " + pending_clip_regen["instructions"],
+                        })
+                    compile_video_prompt(plan, candidate, product_reference_count=product_reference_count)
             video_operation = None
             video_estimate = None
-            if videos_ready:
+            if videos_ready and not pending_clip_regen:
                 video_operation, video_estimate = self._video_operation(job)
                 authorization = job.get("video_generation_authorization") or {}
                 authorized = authorization.get("operation") == video_operation
                 if authorized and approved_max_usd is None:
                     approved_max_usd = Decimal(authorization["approved_max_usd"])
+            elif videos_ready and pending_clip_regen:
+                pending_clip = self._load_plan(job).clips[int(pending_clip_regen["clip_index"]) - 1]
+                video_estimate = Decimal(str(pending_clip.duration_seconds)) * Decimal("0.0225")
             if pending_image_regen:
                 pending_clip = bool(pending_image_regen.get("clip_regeneration"))
                 pending_duration = self._load_plan(job).clips[int(pending_image_regen["clip_index"]) - 1].duration_seconds
@@ -1073,14 +1156,17 @@ class LocalJobService:
                 raise ConfirmationRequired(operation_estimate, "This job exceeds the automatic-spend threshold or its estimate is uncertain.")
             if approved_max_usd is not None and not estimate_within_approved_amount(operation_estimate, approved_max_usd):
                 raise AppError(f"Estimated total ${operation_estimate:.4f} exceeds the approved maximum ${approved_max_usd:.4f}.")
-            project_operation_estimate = operation_estimate if (retry_image_info or pending_image_regen or videos_ready) else estimate.image_usd + estimate.video_usd
+            project_operation_estimate = operation_estimate if (
+                retry_image_info or pending_image_regen or pending_clip_regen or videos_ready
+            ) else estimate.image_usd + estimate.video_usd
             self._check_project_spending_limit(job, project_operation_estimate)
             if pending_clip_regen and not pending_clip_regen.get("image_ready"):
                 pending_image_regen = {"clip_index": pending_clip_regen["clip_index"],
                     "instructions": pending_clip_regen["instructions"], "output_dir": pending_clip_regen["output_dir"],
                     "clip_regeneration": True}
                 job["pending_starting_image_regen"] = pending_image_regen
-            if pending_clip_regen and pending_clip_regen.get("image_ready") and not job.get("images_approved_at"):
+            if (pending_clip_regen and pending_clip_regen.get("image_ready")
+                    and not job.get("images_approved_at") and not pending_clip_image_reusable):
                 job.update(status="awaiting_image_review", stage="awaiting_image_review",
                            message="Review the revised starting image, then approve it to generate the revised clip.",
                            updated_at=_now())
@@ -1089,6 +1175,8 @@ class LocalJobService:
             job["status"] = "generating_clips" if videos_ready else "preparing_images"
             job["stage"] = job["status"]
             job["message"] = "Resuming from saved tasks and outputs." if recoverable else "Preparing starting images for review."
+            if recoverable:
+                job["error"] = None
             job["resume_generation"] = recoverable
             if review_images is not None and not recoverable:
                 job["review_images_before_video"] = bool(review_images)
@@ -1405,8 +1493,11 @@ class LocalJobService:
             if masked_edit:
                 if not base_source:
                     raise AppError("Select an appropriate saved scene image before using masked editing.")
+                if not instructions.strip():
+                    raise AppError("Describe the specific object or area to change before generating a masked candidate.")
                 scene_base = self._resolve_scene_base(job_id, job, base_source)
-                mask_path = find_saved_mask_for_scene(self._job_path(job_id).parent / "outputs", scene_base)
+                mask_path = None
+                mask_metadata = None
                 if mask_upload:
                     filename, data = mask_upload
                     if len(data) > MAX_MASK_IMAGE_BYTES:
@@ -1417,9 +1508,29 @@ class LocalJobService:
                     output_dir.mkdir(parents=True, exist_ok=True)
                     mask_path = output_dir / "scene-inpaint-mask.png"
                     mask_path.write_bytes(data)
+                    mask_metadata = {"method": "user-supplied", "source_sha256": hashlib.sha256(scene_base.read_bytes()).hexdigest()}
+                else:
+                    try:
+                        target = extract_edit_target(instructions)
+                    except AutomaticMaskError as exc:
+                        raise AppError(str(exc)) from exc
+                    mask_path = find_saved_mask_for_scene(
+                        self._job_path(job_id).parent / "outputs", scene_base, target=target,
+                    )
+                if not mask_upload and not mask_path:
+                    output_dir = self._job_path(job_id).parent / "outputs" / f"clip-{clip_index:02d}" / "starting-image" / f"version-{len(clip_record.get('starting_image_history', [])) + 1}"
+                    mask_path = output_dir / "scene-inpaint-mask.png"
+                    try:
+                        mask_metadata = generate_automatic_mask(scene_base, instructions, mask_path)
+                    except AutomaticMaskError as exc:
+                        raise AppError(str(exc)) from exc
+                    mask_metadata["method"] = "local-grounded-sam2"
+                    mask_metadata["source_sha256"] = hashlib.sha256(scene_base.read_bytes()).hexdigest()
                 if not mask_path or not mask_path.is_file():
-                    raise AppError("This scene image has no matching saved mask. Upload a transparent PNG mask, or choose a scene image with a saved mask.")
+                    raise AppError("The automatic mask could not be created. No image request was sent.")
                 _validate_mask_png(mask_path, scene_base)
+            else:
+                mask_metadata = None
             if job.get("estimate_reliable") is False:
                 if approved_max_usd is None:
                     raise ConfirmationRequired(estimate, "Image pricing or this project's estimate is uncertain; approval is required before regenerating this image.")
@@ -1441,10 +1552,11 @@ class LocalJobService:
                 "clip_index": clip_index, "instructions": instructions.strip(), "output_dir": str(output_dir),
                 "masked_edit": masked_edit, "base_source": base_source if masked_edit else None,
                 "mask_path": str(mask_path) if mask_path else None,
+                "mask_metadata": mask_metadata,
             }
             self._save(job)
         self._spawn(self._regenerate_starting_image, job_id, clip, instructions.strip(), output_dir,
-                    False, masked_edit, scene_base, mask_path)
+                    False, masked_edit, scene_base, mask_path, mask_metadata)
         return self.get_job(job_id)
 
     def _resume_starting_image_regen(self, job_id: str) -> None:
@@ -1460,12 +1572,14 @@ class LocalJobService:
             job_id, plan.clips[index - 1], pending.get("instructions", ""), Path(pending["output_dir"]),
             resume=True, masked_edit=bool(pending.get("masked_edit")), scene_base=base,
             mask_path=Path(pending["mask_path"]) if pending.get("mask_path") else None,
+            mask_metadata=pending.get("mask_metadata"),
         )
 
     def _regenerate_starting_image(
         self, job_id: str, clip: PlannedClip, instructions: str, output_dir: Path,
         resume: bool = False, masked_edit: bool = False, scene_base: Path | None = None,
         mask_path: Path | None = None,
+        mask_metadata: dict | None = None,
     ) -> None:
         job = self._read(job_id)
         plan = self._load_plan(job)
@@ -1519,7 +1633,8 @@ class LocalJobService:
                 image_path = run_masked_image_edit(
                     single_plan, prompt_clip, scene_base, mask_path,
                     [Path(p) for p in plan.product_references], character_references,
-                    output_dir, client, scene_prompt=prompt_clip.starting_image_prompt, resume=resume,
+                    output_dir, client, scene_prompt=starting_image_revision_prompt(plan, clip),
+                    resume=resume, instructions=instructions, mask_metadata=mask_metadata,
                 )
                 images = [image_path]
             else:
@@ -1964,12 +2079,7 @@ class LocalJobService:
             self._check_project_spending_limit(job, estimate.image_usd + estimate.video_usd)
             version_number = len(job["clips"][clip_index - 1]["versions"]) + 1
             output_dir = self._job_path(job_id).parent / "outputs" / f"clip-{clip_index:02d}" / f"version-{version_number}"
-            current_image_id = job["clips"][clip_index - 1].get("current_starting_image_asset")
-            current_image_path = job.get("assets", {}).get(current_image_id, {}).get("path")
-            reuse_approved_image = bool(
-                clip.audio_enabled and job.get("images_approved_at") and current_image_path
-                and Path(current_image_path).is_file()
-            )
+            reuse_approved_image = self._has_approved_current_clip_image(job, clip_index)
             job["status"] = "generating_clips" if reuse_approved_image else "regenerating_starting_image"
             job["stage"] = job["status"]
             job["message"] = (
@@ -1978,8 +2088,10 @@ class LocalJobService:
                 f"Preparing a revised starting image for clip {clip_index} (~${IMAGE_1K_USD:.2f})."
             )
             job["active_clip"] = clip_index
-            job["active_stage"] = "regenerating_starting_image"
-            job["images_approved_at"] = None
+            job["active_stage"] = "generating_clips" if reuse_approved_image else "regenerating_starting_image"
+            if not reuse_approved_image:
+                job["images_approved_at"] = None
+            job["error"] = None
             job["pending_clip_regeneration"] = {
                 "clip_index": clip_index, "instructions": instructions.strip(),
                 "output_dir": str(output_dir), "version": version_number, "image_ready": False,
@@ -2000,7 +2112,6 @@ class LocalJobService:
         full_plan = self._load_plan(job)
         original = full_plan.clips[clip_index - 1]
         clip = original.model_copy(update={
-            "starting_image_prompt": original.starting_image_prompt + f"\nClip-specific revision: {instructions}",
             "video_prompt": original.video_prompt + f"\nClip-specific revision: {instructions}",
         })
         old_version = job["clips"][clip_index - 1]["versions"][-1]
@@ -2065,7 +2176,6 @@ class LocalJobService:
         original = full_plan.clips[index - 1]
         instructions = pending["instructions"]
         clip = original.model_copy(update={
-            "starting_image_prompt": original.starting_image_prompt + f"\nClip-specific revision: {instructions}",
             "video_prompt": original.video_prompt + f"\nClip-specific revision: {instructions}",
         })
         single_plan = full_plan.model_copy(update={"clips": [clip]})
@@ -2100,7 +2210,6 @@ class LocalJobService:
         full_plan = self._load_plan(job)
         original = full_plan.clips[clip_index - 1]
         clip = original.model_copy(update={
-            "starting_image_prompt": original.starting_image_prompt + f"\nClip-specific revision: {instructions}",
             "video_prompt": original.video_prompt + f"\nClip-specific revision: {instructions}",
         })
         old_version = job["clips"][clip_index - 1]["versions"][-1]
@@ -2228,6 +2337,7 @@ class LocalJobService:
             "created_at": job["created_at"], "updated_at": job["updated_at"],
             "reference_video_info": video_info,
             "inputs": inputs, "instructions": job["instructions"],
+            "creative_direction_revision": job.get("creative_direction_revision"),
             "analysis": analysis,
             "estimate": job["estimate"], "estimate_reliable": job["estimate_reliable"],
             "spending": self._project_spending(job),
@@ -2782,6 +2892,15 @@ def make_handler(service: LocalJobService) -> type[BaseHTTPRequestHandler]:
                 if len(path) == 4 and path[:2] == ["api", "jobs"] and path[3] == "refine":
                     self._json(HTTPStatus.OK, service.refine_plan(path[2], payload.get("instructions", "")))
                     return
+                if len(path) == 4 and path[:2] == ["api", "jobs"] and path[3] == "creative-direction":
+                    direction = payload.get("creative_direction")
+                    if not isinstance(direction, str):
+                        raise AppError("Creative Direction must be text.")
+                    self._json(HTTPStatus.OK, service.refine_plan(
+                        path[2], "Update the Creative Plan to match the revised Creative Direction.",
+                        updated_creative_direction=direction,
+                    ))
+                    return
                 if len(path) == 4 and path[:2] == ["api", "jobs"] and path[3] == "generate":
                     approved = Decimal(str(payload["approved_max_usd"])) if payload.get("approved_max_usd") is not None else None
                     review_images = payload.get("review_images")
@@ -2821,6 +2940,7 @@ def make_handler(service: LocalJobService) -> type[BaseHTTPRequestHandler]:
             self.send_response(HTTPStatus.OK)
             self.send_header("Content-Type", mimetypes.guess_type(name)[0] or "application/octet-stream")
             self.send_header("Content-Length", str(len(data)))
+            self.send_header("Cache-Control", "no-store")
             self.send_header("X-Content-Type-Options", "nosniff")
             self.send_header("Content-Security-Policy", "default-src 'self'; img-src 'self' blob:; media-src 'self' blob:; style-src 'self'; script-src 'self';")
             self.end_headers()

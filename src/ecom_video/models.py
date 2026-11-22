@@ -4,7 +4,11 @@ from typing import Literal
 
 from pydantic import BaseModel, Field, model_validator
 
-from ecom_video.creative_playbook import IN_STORE_REACTION_PLAYBOOK
+from ecom_video.creative_playbook import (
+    COUNTDOWN_REVEAL_PLAYBOOK,
+    GIFTING_UNBOXING_PLAYBOOK,
+    IN_STORE_REACTION_PLAYBOOK,
+)
 
 AudioMode = Literal["auto", "enabled", "silent"]
 
@@ -29,6 +33,8 @@ class ShotPlan(BaseModel):
     character_groups: list[str] = Field(default_factory=list)
     continuity_notes: list[str] = Field(default_factory=list)
     uncertainties: list[str]
+    source_observation: str = ""
+    applied_user_changes: list[str] = Field(default_factory=list)
 
     @model_validator(mode="after")
     def validate_reference_interval(self) -> "ShotPlan":
@@ -47,8 +53,8 @@ class AnalysisResult(BaseModel):
 
 HOOK_TEMPLATES = {
     "in_store_reaction": IN_STORE_REACTION_PLAYBOOK + " Never imply stock at a named retailer unless established.",
-    "countdown_reveal": "3-2-1 Reveal · Use three distinct visual beats of anticipation, increasing proximity or evidence, then a clear product reveal; do not reduce the hook to overlay text.",
-    "gifting": "Gifting · Show who gives or discovers the product, the physical handoff or reveal, and a specific natural emotional response that pays off why it is a good gift.",
+    "countdown_reveal": COUNTDOWN_REVEAL_PLAYBOOK,
+    "gifting": GIFTING_UNBOXING_PLAYBOOK,
     "versus": "Versus · Make a fair, visually clear side-by-side comparison of the specified products or approaches, then resolve the difference with an observable product-specific result. Do not invent comparative claims.",
     "custom": "Custom · Follow the creator's hook and arrange distinct setup, demonstration, and payoff shots only where they serve the concept.",
 }

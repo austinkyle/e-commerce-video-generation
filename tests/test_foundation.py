@@ -70,6 +70,7 @@ def test_openai_reference_analysis_uses_structured_schema_and_sampled_images(tmp
     shot_schema = request["text"]["format"]["schema"]["properties"]["shots"]["items"]
     assert shot_schema["properties"]["start_seconds"]["type"] == ["number", "null"]
     assert {"creative_role", "starting_state", "action", "ending_state", "camera", "audio_requested", "audio_direction", "continuity_group", "character_groups", "continuity_notes"} <= set(shot_schema["required"])
+    assert {"source_observation", "applied_user_changes"} <= set(shot_schema["required"])
     assert result.shots[0].audio_requested is True
     assert result.shots[0].audio_direction.startswith("Natural cap click")
     assert result.shots[0].character_groups == ["model"]
@@ -82,18 +83,44 @@ def test_openai_reference_analysis_uses_structured_schema_and_sampled_images(tmp
     assert "concrete physical action" in analysis_prompt
     assert "Assign stable character_groups" in analysis_prompt
     assert "creator-requested character replacements take precedence" in analysis_prompt
-    assert "one target clip" in analysis_prompt
+    assert "put a concise faithful account of the unmodified source scene in source_observation" in analysis_prompt.lower()
+    assert "list only explicit creator changes affecting that scene in applied_user_changes" in analysis_prompt.lower()
+    assert "never omit or merge observed source scenes" in analysis_prompt.lower()
     assert "actual final scene" in analysis_prompt
-    assert "Requested target clip count 4 is a maximum" in analysis_prompt
-    assert "fallback only" in analysis_prompt
+    assert "Requested clip count 4 is a preference and cannot remove or merge a source scene" in analysis_prompt
+    assert "5s interface duration only as a fallback" in analysis_prompt
     assert "Reference audio stream metadata: present" in analysis_prompt
     assert "rather than the audio waveform" in analysis_prompt
     assert "final edit duration" in analysis_prompt
-    assert "Never equate source timestamps, generated duration, and final edit duration" in analysis_prompt
+    assert "Never equate absolute source timestamps with target or final edit duration" in analysis_prompt
     assert any("4.400 seconds" in part.get("text", "") for part in request["input"][0]["content"])
 
 
-def test_openai_reference_analysis_sends_long_creator_brief_without_truncation(tmp_path, monkeypatch):
+def test_reveal_reference_analysis_identifies_mechanism_and_keeps_source_scenes(tmp_path, monkeypatch):
+    frame = tmp_path / "frame-01-3.200s.jpg"
+    frame.write_bytes(b"fake-image")
+
+    class Response:
+        def raise_for_status(self): pass
+        def json(self): return {"output": [{"content": [{"type": "output_text", "text": json.dumps({"summary": "Covered device revealed and activated.", "questions": [], "shots": []})}]}]}
+
+    seen = {}
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+    monkeypatch.setattr(openai.httpx, "post", lambda url, **kwargs: (seen.update(kwargs) or Response()))
+    openai.analyze_reference(
+        [frame], "Replace the product only.", "Use supplied product images.", reference_duration_seconds=17.7,
+        hook="countdown_reveal", clip_count=2, seconds_per_clip=5,
+    )
+    prompt = seen["json"]["input"][0]["content"][0]["text"]
+
+    assert "3-2-1 Reveal is a curiosity-and-payoff format" in prompt
+    assert "never infer a literal 3-2-1 countdown" in prompt.lower()
+    assert "whether the reveal is physical or by edit" in prompt
+    assert "preserve every distinct source scene and order" in prompt.lower()
+    assert "only explicit creator substitutions" in prompt
+
+
+def test_openai_reference_analysis_sends_forty_thousand_character_brief_without_truncation(tmp_path, monkeypatch):
     frame = tmp_path / "frame.jpg"
     frame.write_bytes(b"fake-image")
     output = {"summary": "Shared continuity requirements.", "questions": [], "shots": [{
@@ -108,12 +135,15 @@ def test_openai_reference_analysis_sends_long_creator_brief_without_truncation(t
     seen = {}
     monkeypatch.setenv("OPENAI_API_KEY", "test-key")
     monkeypatch.setattr(openai.httpx, "post", lambda url, **kwargs: (seen.update(kwargs) or Response()))
-    brief = "Shared garment and character rules.\n" + ("Distinct request requirement. " * 700)
+    brief_prefix = "Shared garment and character rules.\n"
+    phrase = "Distinct request requirement. "
+    brief = brief_prefix + phrase * ((40_000 - len(brief_prefix)) // len(phrase))
+    brief += "x" * (40_000 - len(brief))
 
     openai.analyze_reference([frame], brief, "Product remains unchanged")
 
     analysis_text = seen["json"]["input"][0]["content"][0]["text"]
-    assert len(brief) > 2000
+    assert len(brief) == 40_000
     assert brief in analysis_text
     assert "complete creator instructions as authoritative" in analysis_text
     assert "shared requirements" in analysis_text
@@ -186,8 +216,8 @@ def test_non_in_store_reference_analysis_does_not_receive_in_store_only_guidance
 
     openai.analyze_reference([frame], "An In-Store Reaction product discovery", hook="in_store_reaction")
     in_store_prompt = seen["json"]["input"][0]["content"][0]["text"]
-    assert "For In-Store Reaction, keep the immediate reaction" in in_store_prompt
-    assert "one primary physical beat" in in_store_prompt.lower()
+    assert "analyze every distinct source scene independently" in in_store_prompt.lower()
+    assert "ordered within-shot actions" in in_store_prompt.lower()
 
 
 def test_legacy_wet_works_hook_keeps_in_store_reaction_direction():

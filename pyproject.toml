@@ -12,6 +12,9 @@ dependencies = [
 [dependency-groups]
 dev = ["pytest>=8,<10"]
 
+[project.optional-dependencies]
+auto-mask = ["torch>=2.5", "torchvision>=0.20", "transformers>=4.57,<5", "pillow>=10", "numpy>=1.26"]
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 

@@ -11,6 +11,7 @@ from ecom_video.costs import estimate_generation, estimate_within_approved_amoun
 from ecom_video.media import probe_video, sample_frames
 from ecom_video.models import AnalysisResult
 from ecom_video.workflow import (
+    MAX_CREATIVE_INSTRUCTIONS,
     MultiClipPlan,
     build_multiclip_plan,
     creative_instruction_length,
@@ -42,8 +43,8 @@ def _analyze(args: argparse.Namespace) -> None:
     from ecom_video.providers.openai import analyze_reference
 
     frames = [Path(p) for p in args.frame]
-    if creative_instruction_length(args.instruction) > 20_000:
-        raise ValueError("creative instructions must be 20,000 characters or fewer")
+    if creative_instruction_length(args.instruction) > MAX_CREATIVE_INSTRUCTIONS:
+        raise ValueError(f"creative instructions must be {MAX_CREATIVE_INSTRUCTIONS:,} characters or fewer")
     if len(frames) > 24:
         raise ValueError("At most 24 frames may be analyzed")
     for path in frames:

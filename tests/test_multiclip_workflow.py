@@ -4,6 +4,7 @@ import json
 from decimal import Decimal
 from pathlib import Path
 from types import SimpleNamespace
+from types import SimpleNamespace
 
 import pytest
 
@@ -46,6 +47,157 @@ def analysis_fixture() -> AnalysisResult:
             ]
         ],
     })
+
+
+def test_reveal_blanket_prompt_keeps_hidden_frame_lift_and_completed_reveal():
+    analysis = AnalysisResult.model_validate({
+        "summary": "A child costume reveal in a Christmas living room.", "questions": [], "shots": [{
+            "index": 1, "start_seconds": 0, "end_seconds": 4.2, "creative_role": "Covered costume reveal",
+            "visual_description": "A child sits beneath a white blanket in a Christmas living room.",
+            "starting_state": "The white blanket fully conceals the seated child; the adult's hands hold its upper edge.",
+            "action": "The adult lifts the blanket from its upper edge as it folds upward and clears the child's head and torso.",
+            "ending_state": "The child is fully visible in a Christmas-tree costume; the blanket is out of frame.",
+            "camera": "Vertical handheld medium shot, fixed on the seated child.", "product_interaction": "The adult lifts the blanket.",
+            "hook_or_payoff": "The costume is revealed.", "source_observation": "Original: one continuous physical blanket lift, completed by 4.2s.",
+            "applied_user_changes": ["Replace only the costume with the supplied product."],
+            "continuity_group": "living-room", "character_groups": ["child", "adult"], "continuity_notes": [], "uncertainties": [],
+        }],
+    })
+    plan = build_multiclip_plan(analysis, "Replace only the costume with the supplied product.", "Costume appearance from product reference.", "Christmas living room", 1, 5, hook="countdown_reveal")
+    clip = plan.clips[0]
+    video = compile_video_prompt(plan, clip)
+
+    assert "fully conceals the seated child" in clip.starting_image_prompt
+    assert "keep the revealed subject hidden" in clip.starting_image_prompt
+    assert "lifts the blanket from its upper edge" in video
+    assert "folds and exits naturally" in video
+    assert "fully visible in a Christmas-tree costume" in video
+    assert "not a countdown cue" in video.lower()
+    assert "Original: one continuous physical blanket lift" in video
+    assert "Replace only the costume" in video
+
+
+def test_reveal_hard_cut_is_preserved_without_unobserved_uncovering():
+    analysis = AnalysisResult.model_validate({
+        "summary": "A projected interactive game demonstration.", "questions": [], "shots": [{
+            "index": 1, "start_seconds": 0, "end_seconds": 5, "creative_role": "Reveal by hard cut",
+            "visual_description": "A person holds a white cover in front of the camera, then the edit cuts to children using a projected game.",
+            "starting_state": "The white cover fills the frame.",
+            "action": "Hard cut from the cover to children aiming toy controllers at projected targets.",
+            "ending_state": "Children play the projected game, with the game unit visible beside the projection.",
+            "camera": "Handheld POV, then source cut to a wide room view.", "product_interaction": "Children aim the controllers at projected targets.",
+            "hook_or_payoff": "The edit reveals the interactive game in use.",
+            "source_observation": "Original transition is an edit cut; no one removes the white cover.",
+            "applied_user_changes": [], "continuity_group": "playroom", "character_groups": ["children"],
+            "continuity_notes": [], "uncertainties": [],
+        }],
+    })
+    plan = build_multiclip_plan(analysis, "Recreate the reference.", "Interactive projection game; preserve observed capability.", "playroom", 1, 5, hook="countdown_reveal")
+    prompt = compile_video_prompt(plan, plan.clips[0])
+
+    assert "Hard cut from the cover" in prompt
+    assert "preserve the hard edit" in prompt
+    assert "no one removes the white cover" in prompt
+    assert "do not animate an unobserved uncovering" in prompt.lower()
+    assert "Preserve each source-required edit cut exactly" in prompt
+    assert "No cuts, morphing" not in prompt
+
+
+def test_reveal_retains_package_installation_and_activation_states_in_order():
+    analysis = AnalysisResult.model_validate({
+        "summary": "A wall-lighting product is unveiled, installed, and activated.", "questions": [], "shots": [
+            {"index": 1, "start_seconds": 0, "end_seconds": 5, "creative_role": "Package reveal", "visual_description": "Covered retail pallet in a store.", "starting_state": "Pallet and packages are concealed by a cover.", "action": "A person lifts the cover.", "ending_state": "Stacked product packages are visible.", "camera": "Wide handheld view.", "product_interaction": "Cover is lifted from the pallet.", "hook_or_payoff": "Product packaging is unveiled.", "source_observation": "Covered pallet is unveiled.", "applied_user_changes": [], "continuity_group": "store", "character_groups": [], "continuity_notes": [], "uncertainties": []},
+            {"index": 2, "start_seconds": 5, "end_seconds": 10, "creative_role": "Unpacked installation", "visual_description": "Unpacked light components are installed on the wall.", "starting_state": "Components and remote are unpacked; display is inactive.", "action": "Person mounts the light and adds ornaments.", "ending_state": "Installed display remains unlit.", "camera": "Medium close-up.", "product_interaction": "Mounts the fixture and ornaments.", "hook_or_payoff": "Installation is complete.", "source_observation": "Unpacked components installed before activation.", "applied_user_changes": [], "continuity_group": "home", "character_groups": ["installer"], "continuity_notes": [], "uncertainties": []},
+            {"index": 3, "start_seconds": 10, "end_seconds": 15, "creative_role": "Activation payoff", "visual_description": "Remote activates the installed wall lights.", "starting_state": "Installed display is inactive; remote is in hand.", "action": "Person presses the remote and the wall lights illuminate.", "ending_state": "The completed wall display glows with the activated effect.", "camera": "Close-up of remote, then wide display.", "product_interaction": "Remote button activates the light.", "hook_or_payoff": "Illuminated final atmosphere.", "source_observation": "Activation follows installation.", "applied_user_changes": [], "continuity_group": "home", "character_groups": ["installer"], "continuity_notes": [], "uncertainties": []},
+        ],
+    })
+    plan = build_multiclip_plan(analysis, "Preserve the reference sequence.", "Wall-lighting kit with remote.", "source locations", 3, 5, hook="countdown_reveal")
+    prompts = [compile_video_prompt(plan, clip) for clip in plan.clips]
+
+    assert [clip.source_start_seconds for clip in plan.clips] == [0, 5, 10]
+    assert "Stacked product packages" in prompts[0]
+    assert "Components and remote are unpacked" in prompts[1]
+    assert "remains unlit" in prompts[1]
+    assert "presses the remote" in prompts[2]
+    assert "illuminate" in prompts[2]
+
+
+def test_reveal_preserves_recurring_identity_across_intentional_variants_and_locations():
+    analysis = AnalysisResult.model_validate({
+        "summary": "A child models two intentional costume variants in different locations.", "questions": [], "shots": [
+            {"index": 1, "start_seconds": 0, "end_seconds": 4, "creative_role": "Tree costume reveal", "visual_description": "Child wears a Christmas-tree costume in a living room.", "starting_state": "Child is concealed beneath a blanket.", "action": "Adult lifts the blanket.", "ending_state": "Child wears the tree costume.", "camera": "Medium shot.", "product_interaction": "Adult lifts blanket.", "hook_or_payoff": "Tree costume revealed.", "source_observation": "Tree costume reveal.", "applied_user_changes": [], "continuity_group": "living-room", "character_groups": ["child"], "continuity_notes": ["Same child's face and proportions."], "uncertainties": []},
+            {"index": 2, "start_seconds": 4, "end_seconds": 8, "creative_role": "Gingerbread costume variation", "visual_description": "The same child wears an intentional gingerbread costume in the next shot.", "starting_state": "Child is already in the gingerbread costume outdoors.", "action": "Child turns toward camera.", "ending_state": "Gingerbread details are visible.", "camera": "Handheld full shot.", "product_interaction": "Costume is worn naturally.", "hook_or_payoff": "A second costume variant is shown.", "source_observation": "Intentional second costume variant in a new shot.", "applied_user_changes": [], "continuity_group": "winter-street", "character_groups": ["child"], "continuity_notes": ["Same child's face and proportions; allow the source's costume and location change."], "uncertainties": []},
+        ],
+    })
+    plan = build_multiclip_plan(analysis, "Keep the child identity and source variants.", "Use exact costume details from product references.", "match each source shot", 2, 5, hook="countdown_reveal")
+
+    assert plan.clips[0].character_groups == plan.clips[1].character_groups == ["child"]
+    assert plan.clips[0].continuity_group != plan.clips[1].continuity_group
+    assert "Christmas-tree costume" in plan.clips[0].visual_description
+    assert "gingerbread costume" in plan.clips[1].visual_description
+    assert "allow the source's costume and location change" in " ".join(plan.clips[1].continuity_notes)
+
+
+def test_versus_reference_does_not_receive_reveal_choreography():
+    analysis = analysis_fixture()
+    plan = build_multiclip_plan(analysis, "Fairly compare both products.", "Two products.", "snowy driveway", 3, 5, hook="versus")
+    prompt = compile_video_prompt(plan, plan.clips[0])
+
+    assert "preserve the hard edit" not in prompt
+    assert "do not add a literal countdown" not in prompt.lower()
+    assert "concealed or uncertain" not in prompt
+
+
+def test_reveal_motion_only_revision_keeps_format_rules_under_prompt_budget():
+    analysis = AnalysisResult.model_validate({
+        "summary": "A covered product is revealed.", "questions": [], "shots": [{
+            "index": 1, "start_seconds": 0, "end_seconds": 4, "creative_role": "Physical reveal",
+            "visual_description": "A covered device on a table.", "starting_state": "A blue cloth fully hides the device.",
+            "action": "A hand lifts the cloth from the left edge until the device is fully visible.",
+            "ending_state": "The device sits uncovered on the table.", "camera": "Handheld medium close-up.",
+            "product_interaction": "Hand pulls the cloth from its edge.", "hook_or_payoff": "Device reveal.",
+            "source_observation": "One uninterrupted cloth lift; the approved image has the covered starting geometry.",
+            "applied_user_changes": [], "continuity_group": "table", "character_groups": [],
+            "continuity_notes": [], "uncertainties": [],
+        }],
+    })
+    plan = build_multiclip_plan(analysis, "Recreate the cover reveal.", "Use product image for device appearance.", "tabletop", 1, 5, hook="countdown_reveal")
+    clip = plan.clips[0].model_copy(update={
+        "video_prompt": plan.clips[0].video_prompt + "\nClip-specific revision: Motion-only correction: add a one-beat pause while the adult grips the upper hem before lifting.",
+    })
+    prompt = compile_video_prompt(plan, clip)
+
+    assert "one-beat pause" in prompt
+    assert "fully hides the device" in prompt
+    assert "folds and exits naturally" in prompt
+    assert len(prompt) <= 3800
+
+
+def test_reveal_starting_images_keep_cover_hidden_and_use_product_reference_after_reveal(tmp_path):
+    analysis = AnalysisResult.model_validate({
+        "summary": "A covered device is revealed and demonstrated.", "questions": [], "shots": [
+            {"index": 1, "start_seconds": 0, "end_seconds": 4, "creative_role": "Covered reveal", "visual_description": "A device is hidden beneath a blue cloth on a table.", "starting_state": "The device is fully hidden under the cloth.", "action": "A hand lifts the cloth from its edge until the device is fully revealed.", "ending_state": "The device is uncovered on the table.", "camera": "Vertical handheld medium shot.", "product_interaction": "Hand lifts the cloth.", "hook_or_payoff": "Device reveal.", "source_observation": "One continuous covered reveal.", "applied_user_changes": [], "continuity_group": "table", "character_groups": [], "continuity_notes": [], "uncertainties": []},
+            {"index": 2, "start_seconds": 4, "end_seconds": 8, "creative_role": "Product proof", "visual_description": "The revealed device is used on the table.", "starting_state": "The device is visible and inactive on the table.", "action": "A hand presses the visible activation control; the device turns on.", "ending_state": "The device is visibly active.", "camera": "Close handheld view.", "product_interaction": "Press the observed activation control.", "hook_or_payoff": "Show the real activated result.", "source_observation": "Product use follows the reveal.", "applied_user_changes": [], "continuity_group": "table", "character_groups": [], "continuity_notes": [], "uncertainties": []},
+        ],
+    })
+    product = tmp_path / "device.jpg"
+    product.write_bytes(b"product-reference")
+    plan = build_multiclip_plan(analysis, "Recreate the reveal and use.", "Device appearance from supplied product photo.", "tabletop", 2, 5, product_references=[product], hook="countdown_reveal")
+    kie = FakeKie()
+
+    run_multiclip_generation(plan, [product], [], tmp_path / "reveal-images", kie, images_only=True)
+    image_calls = [call for call in kie.calls if call[0] in {"image", "text_image"}]
+    manifest = json.loads((tmp_path / "reveal-images" / "generation-usage.json").read_text())
+
+    assert len(image_calls) == 2
+    assert image_calls[0][0] == "text_image"
+    assert image_calls[1][0] == "image"
+    assert "https://files.test/device.jpg" in image_calls[1][2]
+    first_roles = manifest["tasks"][0]["request"]["references"]
+    second_roles = manifest["tasks"][1]["request"]["references"]
+    assert not any(ref["filename"] == "device.jpg" for ref in first_roles)
+    assert {ref["filename"]: ref["role"] for ref in second_roles}["device.jpg"] == "product identity only"
+    assert "@image2=product only" in compile_video_prompt(plan, plan.clips[1], product_reference_count=1)
 
 
 def test_plan_uses_distinct_reference_shots_and_same_environment_for_image_and_video():
@@ -134,7 +286,7 @@ def test_legacy_silent_and_audio_plans_load_with_automatic_mode():
     assert restored.clips[1].audio_enabled is True
 
 
-def test_in_store_reaction_fits_complete_hook_in_one_clip_and_keeps_reference_ending():
+def test_in_store_reference_preserves_every_source_scene_and_its_timing():
     analysis = AnalysisResult.model_validate({
         "summary": "A shopper reacts to a laundry basketball hamper, then the product is installed, loaded, and shown in its final state.",
         "questions": [],
@@ -148,26 +300,22 @@ def test_in_store_reaction_fits_complete_hook_in_one_clip_and_keeps_reference_en
         ],
     })
 
-    fitted = fit_reference_analysis_to_clip_count(analysis, 4, hook="in_store_reaction", seconds_per_clip=5)
-    plan = build_multiclip_plan(fitted, "Recreate the In-Store Reaction structure.", "Keep the black mesh hamper unchanged.", "the referenced scene", 4, 5, hook="in_store_reaction")
+    plan = build_multiclip_plan(analysis, "Recreate the In-Store Reaction structure.", "Keep the black mesh hamper unchanged.", "the referenced scene", 6, 5, hook="in_store_reaction")
 
-    assert len(fitted.shots) == 4
-    assert len(analysis.shots) == 6
-    assert fitted.shots[0].start_seconds == 0 and fitted.shots[0].end_seconds == 4.2
-    assert "reaction" in fitted.shots[0].creative_role.lower()
-    assert "product reveal" in fitted.shots[0].creative_role.lower()
-    assert "quick natural pan/reframe" in fitted.shots[0].camera
-    assert "already stopped" in fitted.shots[0].starting_state
-    assert "already reacting" in fitted.shots[0].action
-    assert "identifiable view of the product" in fitted.shots[0].action
-    assert "identifiable product display" in fitted.shots[0].ending_state
-    assert [(shot.start_seconds, shot.end_seconds) for shot in fitted.shots[1:]] == [(4.2, 6.4), (6.4, 10.4), (10.4, 14.5)]
+    assert len(plan.clips) == len(analysis.shots) == 6
+    assert [(clip.source_start_seconds, clip.source_end_seconds) for clip in plan.clips] == [
+        (0, 2), (2, 4.2), (4.2, 6.4), (6.4, 8.4), (8.4, 10.4), (10.4, 14.5),
+    ]
+    assert [clip.action for clip in plan.clips] == [shot.action for shot in analysis.shots]
+    assert plan.clips[0].action == "She pauses with a surprised expression."
+    assert "She points with the cane" in plan.clips[1].action
+    assert "product is identifiable" in plan.clips[1].ending_state
     assert all(clip.duration_seconds == 5 for clip in plan.clips)
     assert plan.clips[-1].source_end_seconds == 14.5
-    assert "single 5-second target clip" in plan.clips[0].video_prompt
     compact = compile_video_prompt(plan, plan.clips[0])
-    assert "Hook direction: immediate, emotionally legible shopper reaction" in compact
-    assert "Reference segment 0.0-4.2s" in compact
+    assert "Hook direction: reproduce only the observed reaction" in compact
+    assert "Reference segment 0.0-2.0s is the production blueprint" in compact
+    assert "change only explicit targets; add, omit, merge, or reorder nothing" in compact.lower()
 
 
 def test_in_store_reaction_uses_scene_specific_cast_durations_and_product_mechanics():
@@ -192,6 +340,8 @@ def test_in_store_reaction_uses_scene_specific_cast_durations_and_product_mechan
     assert [clip.duration_seconds for clip in plan.clips] == [4, 3, 3, 3, 3]
     assert [clip.edit_duration_seconds for clip in plan.clips] == [3.5, 2, 2, 2.5, 2.5]
     assert plan.hook == "in_store_reaction"
+    for clip in plan.clips:
+        assert len(compile_video_prompt(plan, clip, product_reference_count=6)) <= 3800
     hook_prompt = compile_video_prompt(plan, plan.clips[0])
     assert "Hook direction:" in hook_prompt and "4-second clip" in hook_prompt
     assert "Opening hook:" not in hook_prompt
@@ -199,11 +349,284 @@ def test_in_store_reaction_uses_scene_specific_cast_durations_and_product_mechan
     assert "fast pan" in hook_prompt
     setup_prompt = compile_video_prompt(plan, plan.clips[2])
     assert "supplied connector" in setup_prompt and "matching port" in setup_prompt
+    assert "Product-specific payoff:" not in setup_prompt
     payoff_prompt = compile_video_prompt(plan, plan.clips[4])
     assert "seats in its designed cradle" in payoff_prompt
     assert "elderly shopper" not in payoff_prompt.lower()
     assert "Different person from the first-use clip" in payoff_prompt
     assert "preserve the person already visible in the supplied starting image" in payoff_prompt.lower()
+
+
+def test_canonical_in_store_reference_actions_states_and_scene_changes_are_preserved():
+    analysis = AnalysisResult.model_validate({
+        "summary": "Reference recreation. Make the mother Black; keep the hoodie pink only where worn in the source.",
+        "questions": [],
+        "shots": [
+            {"index": 1, "start_seconds": 0, "end_seconds": 3.5, "creative_role": "In-store reaction and reveal",
+             "visual_description": "A mother in a clothing store holds her baby and iced coffee beside a rack of pink babywearing hoodies.",
+             "starting_state": "She is already surprised, supporting the baby in one arm and holding the intact iced coffee in her other hand; she wears a dark sleeveless top.",
+             "action": "At about 1.2 seconds she releases the cup and it falls under gravity; her attention stays on the display as the handheld camera pans right, moving her out of frame and revealing the hoodie rack.",
+             "ending_state": "The camera lands on the actual rack of pink babywearing hoodies.",
+             "camera": "Vertical handheld medium reaction shot followed by a rightward pan to the rack.",
+             "product_interaction": "The coffee leaves her hand; the baby remains supported.", "hook_or_payoff": "The product display resolves her reaction.",
+             "continuity_group": "store", "character_groups": ["mother", "baby"], "continuity_notes": ["Black mother; dark sleeveless top in store; same baby."], "target_duration_seconds": 4, "uncertainties": [],
+             "source_observation": "Original source: mother wears a dark sleeveless top, holds a supported baby and iced coffee, releases coffee at about 1.2 seconds, then the camera pans right to the hoodie rack.",
+             "applied_user_changes": ["Make the mother Black; change no other character or wardrobe."]},
+            {"index": 2, "start_seconds": 3.5, "end_seconds": 6.5, "creative_role": "Physical product demonstration",
+             "visual_description": "On an outdoor walkway, the mother wears the pink integrated babywearing hoodie.",
+             "starting_state": "The baby begins elevated above and partly aligned with the open pouch; the mother supports the baby with both hands.",
+             "action": "She continuously supports the baby's body while lowering the baby visibly into the pouch, then adjusts the fabric without releasing support.",
+             "ending_state": "The baby is positioned in the pouch and remains supported.", "camera": "Handheld medium view of the pouch and both supporting hands.",
+             "product_interaction": "Visible downward placement into the integrated pouch.", "hook_or_payoff": "Show the garment's actual use.",
+             "continuity_group": "walkway", "character_groups": ["mother", "baby"], "continuity_notes": ["Same Black mother and baby; pink hoodie."], "target_duration_seconds": 3, "uncertainties": [],
+             "source_observation": "Original source: on the outdoor walkway, the baby starts above and partly aligned with the open pouch; mother supports with both hands, lowers the baby, adjusts fabric, and the baby ends inside.",
+             "applied_user_changes": ["Make the mother Black; change no other character or action."]},
+            {"index": 3, "start_seconds": 6.5, "end_seconds": 10.5, "creative_role": "Everyday lifestyle use",
+             "visual_description": "At an outdoor pumpkin market with wooden stalls and string lights, the mother wears the same hoodie and carries the baby in its pouch.",
+             "starting_state": "The mother holds a shopping bag while walking naturally through the market.",
+             "action": "She moves naturally and lifts and adjusts the hood fabric around the baby.", "ending_state": "She continues through the market with the baby settled in the pouch.",
+             "camera": "Casual handheld medium shot with subtle movement.", "product_interaction": "One hand adjusts the hood while the other holds the bag.",
+             "hook_or_payoff": "Show everyday use.", "continuity_group": "market", "character_groups": ["mother", "baby"], "continuity_notes": ["Same Black mother, baby, and pink hoodie."], "target_duration_seconds": 4, "uncertainties": []},
+            {"index": 4, "start_seconds": 10.5, "end_seconds": 14.12, "creative_role": "Emotional payoff",
+             "visual_description": "In an indoor nursery the mother wears the hoodie and holds her baby close within the garment.",
+             "starting_state": "Mother and baby are already close together.", "action": "She gently touches, cuddles, and nuzzles the baby with small natural movements.",
+             "ending_state": "They remain close as the moment ends naturally.", "camera": "Intimate handheld close composition.",
+             "product_interaction": "The baby stays close and supported within the garment.", "hook_or_payoff": "Quiet emotional resolution.",
+             "continuity_group": "nursery", "character_groups": ["mother", "baby"], "continuity_notes": ["Same Black mother, baby, and pink hoodie."], "target_duration_seconds": 4, "uncertainties": []},
+        ],
+    })
+    plan = build_multiclip_plan(analysis, "Make the mother Black; hoodie pink where worn in reference.", "Use the supplied product references.", "match each source scene", 4, 5, hook="wet_works")
+
+    assert [(clip.source_start_seconds, clip.source_end_seconds) for clip in plan.clips] == [(0, 3.5), (3.5, 6.5), (6.5, 10.5), (10.5, 14.12)]
+    assert "dark sleeveless top in store" in plan.clips[0].starting_image_prompt
+    assert "pink integrated babywearing hoodie" in plan.clips[1].visual_description
+    assert "Original source: mother wears a dark sleeveless top" in plan.clips[0].source_observation
+    assert plan.clips[0].applied_user_changes == ["Make the mother Black; change no other character or wardrobe."]
+    assert "She is already surprised" in plan.clips[0].starting_image_prompt
+    assert "intact iced coffee" in plan.clips[0].starting_image_prompt
+    assert "releases the cup" in compile_video_prompt(plan, plan.clips[0])
+    assert "pans right" in compile_video_prompt(plan, plan.clips[0])
+    assert "Observed original source scene: Original source: mother wears a dark sleeveless top" in compile_video_prompt(plan, plan.clips[0])
+    assert "Explicit changes authorized for this scene: Make the mother Black" in compile_video_prompt(plan, plan.clips[0])
+    assert "baby begins elevated above and partly aligned" in plan.clips[1].starting_image_prompt
+    placement = compile_video_prompt(plan, plan.clips[1])
+    assert "lowering the baby visibly into the pouch" in placement
+    assert "continuously supports" in placement
+    assert "pumpkin market" in plan.clips[2].starting_image_prompt
+    assert "shopping bag" in compile_video_prompt(plan, plan.clips[2])
+    assert "adjusts the hood fabric" in compile_video_prompt(plan, plan.clips[2])
+    assert "nursery" in plan.clips[3].starting_image_prompt
+    assert "cuddles, and nuzzles" in compile_video_prompt(plan, plan.clips[3])
+    prompts = [compile_video_prompt(plan, clip) for clip in plan.clips]
+    assert all(len(prompt) <= 3800 for prompt in prompts)
+    assert "already surprised" in prompts[0]
+    assert "intact iced coffee" in prompts[0]
+    assert "falls under gravity" in prompts[0]
+    assert "baby remains supported" in prompts[0]
+    assert "pans right" in prompts[0]
+    assert "actual rack of pink babywearing hoodies" in prompts[0]
+    assert "handheld" in prompts[0].lower()
+    audio_prompt = compile_video_prompt(plan, plan.clips[0].model_copy(update={
+        "audio_mode": "enabled",
+        "audio_direction": "Synchronize a realistic coffee-cup impact and spill sound to the cup striking the floor; no music.",
+    }))
+    assert "synchronize a realistic coffee-cup impact and spill sound" in audio_prompt.lower()
+    assert "Synchronize each selected native sound to the visible event" in audio_prompt
+    compact_drop = plan.clips[0].model_copy(update={
+        "action": "She releases the iced coffee and the cup drops; she keeps the baby supported.",
+    })
+    assert "released object falling under gravity" in compile_video_prompt(plan, compact_drop).lower()
+    for clip in plan.clips:
+        prompt = prompts[clip.index - 1]
+        assert "production blueprint" in prompt
+        assert "change only explicit targets; add, omit, merge, or reorder nothing" in prompt.lower()
+
+
+def test_different_in_store_reference_does_not_inherit_canonical_example():
+    analysis = AnalysisResult.model_validate({"summary": "A shopper notices a compact umbrella display in an ordinary hardware store.", "questions": [], "shots": [{
+        "index": 1, "start_seconds": 0, "end_seconds": 3, "creative_role": "Discovery",
+        "visual_description": "A shopper pauses beside an umbrella display in a hardware store.",
+        "starting_state": "The shopper holds a folded umbrella and looks at the shelf.",
+        "action": "The shopper opens the umbrella once and looks at the canopy.",
+        "ending_state": "The umbrella canopy is open beside the shelf.", "camera": "Static handheld medium framing.",
+        "product_interaction": "The shopper opens the umbrella by hand.", "hook_or_payoff": "Reveal the compact canopy.",
+        "continuity_group": "hardware-store", "character_groups": ["shopper"], "continuity_notes": ["Same shopper and umbrella."], "uncertainties": [],
+    }]})
+    plan = build_multiclip_plan(analysis, "Recreate the reference; replace only the umbrella color with blue.", "Compact umbrella with a manually opened canopy.", "match source", 1, 5, hook="in_store_reaction")
+    prompt = plan.clips[0].starting_image_prompt + compile_video_prompt(plan, plan.clips[0])
+    assert "blue" in prompt
+    for inherited in ("coffee", "baby", "hoodie", "pumpkin", "nursery"):
+        assert inherited not in prompt.lower()
+    from ecom_video.workflow import starting_image_revision_prompt
+    revised_image = starting_image_revision_prompt(plan, plan.clips[0], "Keep the umbrella blue.")
+    assert "coffee" not in revised_image.lower()
+    assert "folded umbrella and looks at the shelf" in revised_image
+    assert "Requested revision: Keep the umbrella blue." in revised_image
+
+
+def test_reference_plan_revision_prompt_preserves_source_scene_structure(monkeypatch):
+    from ecom_video.providers import openai as provider
+
+    data = {"summary": "A short product demonstration.", "questions": [], "shots": [
+        {"index": 1, "start_seconds": 0, "end_seconds": 3, "creative_role": "Hook", "visual_description": "A shopper finds the product.",
+         "starting_state": "The product remains on the shelf.", "action": "The shopper turns toward it.", "ending_state": "The shopper faces the product.",
+         "target_duration_seconds": 3, "edit_duration_seconds": 2.5, "camera": "Handheld pan.", "product_interaction": "No contact.",
+         "hook_or_payoff": "Discovery.", "audio_requested": False, "audio_direction": "Silent.", "continuity_group": "store",
+         "character_groups": ["shopper"], "continuity_notes": ["Same aisle."], "uncertainties": []},
+    ]}
+    captured = {}
+    response_payload = {
+        "output": [{"content": [{
+            "type": "output_text",
+            "text": json.dumps({"summary": data["summary"], "changed_shot_indices": [1], "shots": data["shots"]}),
+        }]}],
+        "usage": {},
+    }
+    monkeypatch.setattr(provider, "require_key", lambda name: "mock-key")
+    monkeypatch.setattr(provider.httpx, "post", lambda *args, **kwargs: captured.update(kwargs) or SimpleNamespace(
+        raise_for_status=lambda: None, json=lambda: response_payload,
+    ))
+
+    provider.revise_creative_plan("Make only the shopper's jacket green.", data, {"mode": "reference", "hook": "in_store_reaction"})
+    prompt = captured["json"]["input"][0]["content"][0]["text"]
+
+    assert "production blueprint" in prompt
+    assert "source scene boundary, order, source timestamp, target duration" in prompt
+    assert "Keep original observations distinct from the user's requested changes" in prompt
+    assert "Make only the shopper's jacket green." in prompt
+
+
+def test_reference_analysis_prompt_scopes_changes_and_preserves_observed_footage(tmp_path, monkeypatch):
+    from ecom_video.providers import openai as provider
+
+    frame = tmp_path / "frame-0.000s.jpg"
+    frame.write_bytes(b"mock-frame")
+    result = AnalysisResult.model_validate({"summary": "A shopper discovers a blue umbrella.", "questions": [], "shots": [{
+        "index": 1, "start_seconds": 0, "end_seconds": 3, "creative_role": "Discovery",
+        "visual_description": "A shopper stands by an umbrella display.", "starting_state": "The umbrella is folded on a shelf.",
+        "action": "The shopper lifts the umbrella from the shelf.", "ending_state": "The shopper holds the umbrella.",
+        "target_duration_seconds": 3, "edit_duration_seconds": 3, "camera": "Handheld medium shot.",
+        "product_interaction": "The shopper holds the handle.", "hook_or_payoff": "Show the umbrella.", "audio_requested": False,
+        "audio_direction": "Silent.", "continuity_group": "store", "character_groups": ["shopper"],
+        "continuity_notes": ["Same shopper."], "uncertainties": [],
+    }]})
+    captured = {}
+    response_payload = {"output": [{"content": [{"type": "output_text", "text": result.model_dump_json()}]}], "usage": {}}
+    monkeypatch.setattr(provider, "require_key", lambda name: "mock-key")
+    monkeypatch.setattr(provider.httpx, "post", lambda *args, **kwargs: captured.update(kwargs) or SimpleNamespace(
+        raise_for_status=lambda: None, json=lambda: response_payload,
+    ))
+
+    provider.analyze_reference([frame], "Change only the umbrella color to blue.", "Confirmed compact umbrella.", hook="wet_works")
+    prompt = captured["json"]["input"][0]["content"][0]["text"]
+
+    assert "faithful reference recreation" in prompt
+    assert "preserve its scene count, order, approximate timing" in prompt.lower()
+    assert "never omit or merge observed source scenes" in prompt.lower()
+    assert "Change only the umbrella color to blue." in prompt
+    assert "Source-video duration" not in prompt
+
+
+def test_gifting_reference_analysis_captures_physical_unboxing_without_imposing_story_beats(tmp_path, monkeypatch):
+    from ecom_video.providers import openai as provider
+
+    frame = tmp_path / "frame-0.000s.jpg"
+    frame.write_bytes(b"mock-frame")
+    result = analysis_fixture()
+    captured = {}
+    payload = {"output": [{"content": [{"type": "output_text", "text": result.model_dump_json()}]}], "usage": {}}
+    monkeypatch.setattr(provider, "require_key", lambda name: "mock-key")
+    monkeypatch.setattr(provider.httpx, "post", lambda *args, **kwargs: captured.update(kwargs) or SimpleNamespace(
+        raise_for_status=lambda: None, json=lambda: payload,
+    ))
+
+    provider.analyze_reference(
+        [frame], "Replace only the robe with the supplied jacket.", "Use supplied product identity photos.",
+        hook="gifting", clip_count=3, seconds_per_clip=5,
+    )
+    prompt = captured["json"]["input"][0]["content"][0]["text"].lower()
+
+    assert "cannot remove or merge a source scene" in prompt
+    assert "sealed/open/partial/empty state" in prompt
+    assert "hand/tool placement" in prompt
+    assert "source_observation" in prompt and "applied_user_changes" in prompt
+    assert "do not infer delight" in prompt
+    assert "six-stage framework" in prompt
+
+
+def test_gifting_keeps_each_source_scene_and_compiles_opening_and_demo_physics():
+    analysis = AnalysisResult.model_validate({
+        "summary": "A quiet present becomes a useful product demo.", "questions": [], "shots": [
+            {"index": 1, "start_seconds": 0, "end_seconds": 2.4, "creative_role": "Unboxing", "visual_description": "Hands open a kraft mailing box on a kitchen table.", "starting_state": "The kraft mailing box is fully sealed; the blue fabric pouch is inside beneath folded paper.", "action": "One hand steadies the box while the other peels its paper seal, folds back both top flaps, lifts the paper insert, and removes the blue pouch by its top seam.", "ending_state": "The open box and removed blue pouch are visible on the same table.", "camera": "Top-down handheld phone view of both hands and the box.", "product_interaction": "Fingers grip and pull the paper seal; the box flaps hinge outward.", "hook_or_payoff": "The pouch is physically revealed.", "source_observation": "Original: unopened kraft box, seal peeled, flaps folded outward, paper insert lifted, blue pouch removed by its top seam.", "applied_user_changes": ["Replace only the pouch with the supplied green version."], "continuity_group": "kitchen", "character_groups": ["hands-a"], "continuity_notes": ["Same hands and table."], "uncertainties": []},
+            {"index": 2, "start_seconds": 2.4, "end_seconds": 5.7, "creative_role": "Product demonstration", "visual_description": "The green pouch is clipped to a backpack outdoors.", "starting_state": "The same green pouch is unzipped on a backpack strap; a hand holds the zipper tab.", "action": "The hand pulls the zipper fully closed, then attaches the existing clip to the backpack strap.", "ending_state": "The pouch hangs securely from the strap with zipper closed.", "camera": "Waist-height handheld close shot against the same outdoor path.", "product_interaction": "Pull the zipper tab along its track and fasten the visible clip to the strap.", "hook_or_payoff": "The useful carry function is shown.", "source_observation": "Original: zipper closes, pouch clip fastens to a backpack strap.", "applied_user_changes": ["Replace only the pouch with the supplied green version."], "continuity_group": "outdoor", "character_groups": ["hands-a"], "continuity_notes": ["Same hand identity, green pouch geometry unchanged."], "uncertainties": []},
+        ]
+    })
+    plan = build_multiclip_plan(analysis, "Replace only the pouch color.", "Pouch has a zipper and one metal clip.", "match each source scene", len(analysis.shots), 5, hook="gifting")
+
+    assert len(plan.clips) == 2
+    assert [(clip.source_start_seconds, clip.source_end_seconds) for clip in plan.clips] == [(0, 2.4), (2.4, 5.7)]
+    opening, demo = plan.clips
+    assert "fully sealed" in opening.starting_image_prompt
+    assert "Do not show a product already removed" in opening.starting_image_prompt
+    assert "peels its paper seal" in compile_video_prompt(plan, opening)
+    assert "removed by its top seam" in compile_video_prompt(plan, opening)
+    assert "Original: unopened kraft box" in compile_video_prompt(plan, opening)
+    assert "Replace only the pouch" in compile_video_prompt(plan, opening)
+    assert "outdoors" in demo.starting_image_prompt
+    assert "zipper fully closed" in compile_video_prompt(plan, demo)
+    assert "hangs securely from the strap" in compile_video_prompt(plan, demo)
+    assert "kitchen table" not in demo.starting_image_prompt
+    assert len(compile_video_prompt(plan, opening)) <= 3800
+
+
+def test_gifting_keeps_scene_reference_separate_from_product_identity(tmp_path):
+    plan = build_multiclip_plan(
+        analysis_fixture(), "Recreate the gift demo.", "Preserve the supplied pouch's exact design.",
+        "the analyzed scenes", 3, 5, hook="gifting",
+    )
+    product = tmp_path / "product.jpg"
+    scene = tmp_path / "scene.png"
+    product.write_bytes(b"product")
+    scene.write_bytes(b"scene")
+    kie = FakeKie()
+
+    run_multiclip_generation(
+        plan, [product], [scene], tmp_path / "gifting-references", kie,
+        images_only=True, continuity_reference_roles=["same-scene composition only"],
+    )
+
+    image = next(call for call in kie.calls if call[0] == "image")
+    assert image[2][:2] == ["https://files.test/scene.png", "https://files.test/product.jpg"]
+    assert "same-scene composition only" in image[1]
+    assert "product identity only" in image[1]
+
+
+def test_gifting_motion_revision_compacts_without_dropping_unboxing_mechanics():
+    analysis = AnalysisResult.model_validate({
+        "summary": "A gift is opened and used.", "questions": [], "shots": [{
+            "index": 1, "start_seconds": 0, "end_seconds": 3.5, "creative_role": "Unboxing",
+            "visual_description": "Hands open a small cardboard mailer on a desk.",
+            "starting_state": "The cardboard mailer is sealed with the green pouch inside.",
+            "action": "One hand steadies the mailer while the other tears the paper tab, folds the top flap back, and lifts the pouch by its side seam.",
+            "ending_state": "The open mailer and pouch are visible on the desk.", "camera": "Overhead handheld phone close-up.",
+            "product_interaction": "Tear the paper tab and lift the pouch by its side seam.",
+            "hook_or_payoff": "A useful pouch is revealed.", "source_observation": "The source shows a physical tab tear, flap opening, then pouch removal.",
+            "applied_user_changes": [], "continuity_group": "desk", "character_groups": ["hands"],
+            "continuity_notes": ["Same hands, mailer, pouch and desk."], "uncertainties": [],
+        }],
+    })
+    plan = build_multiclip_plan(analysis, "Recreate the source.", "Green fabric pouch with one zipper.", "desk", 1, 5, hook="gifting")
+    clip = plan.clips[0].model_copy(update={
+        "video_prompt": plan.clips[0].video_prompt + "\nClip-specific revision: Motion-only correction: pause briefly after the flap opens. " +
+        " Preserve the supplied packaging and the same opening action." * 120,
+    })
+    prompt = compile_video_prompt(plan, clip)
+
+    assert len(prompt) <= 3800
+    assert "pause briefly after the flap opens" in prompt
+    assert "tears the paper tab" in prompt
+    assert "lifts the pouch by its side seam" in prompt
+    assert "source shows a physical tab tear" in prompt
 
 
 def test_non_in_store_compiled_prompts_keep_existing_global_summary_behavior():
@@ -232,10 +655,10 @@ def test_in_store_video_prompt_adds_compact_realism_and_action_density_rules():
     assert "Show one primary physical beat" in prompt
     assert "Match reference handheld pace" in prompt
     assert "Preserve product geometry, texture, exposure, and practical lights" in prompt
-    assert "unretouched skin texture" in image_prompt
-    assert "natural eyes and hair" in image_prompt
-    assert "animation-ready pre-action pose" in image_prompt
-    assert "practical light, shadows, exposure, and natural color" in image_prompt
+    assert "natural unretouched skin" in image_prompt
+    assert "eyes, hair, and proportions" in image_prompt
+    assert "relaxed pre-action pose" in image_prompt
+    assert "Match practical light and shadows" in image_prompt
     assert "keep face, hair, age, body scale, wardrobe, skin texture, and scene lighting stable" in prompt
     assert "avoid facial shimmer, beauty smoothing, and identity drift" in prompt
     assert len(image_prompt) < 1_000
@@ -285,7 +708,8 @@ def test_in_store_reaction_source_controls_gaze_expression_and_camera():
 
     principle = "Align eye line, expression, and camera movement with the stated reaction source; keep attention on it through incidental actions."
     assert principle in IN_STORE_REACTION_PLAYBOOK
-    assert principle in prompt
+    assert "Hook direction: reproduce only the observed reaction" in prompt
+    assert "Adjust the kitten in the pouch" in prompt
 
 
 def test_in_store_starting_image_stays_natural_and_reaction_needs_no_coffee():
@@ -310,10 +734,11 @@ def test_in_store_starting_image_stays_natural_and_reaction_needs_no_coffee():
     video_prompt = compile_video_prompt(plan, plan.clips[0])
 
     assert "relaxed shoulders" in image_prompt
-    assert "unretouched skin texture" in image_prompt
+    assert "natural unretouched skin" in image_prompt
     assert "Frame zero" in image_prompt
     assert "lantern" in video_prompt and "left" in video_prompt
-    assert "Align eye line, expression, and camera movement with the stated reaction source" in video_prompt
+    assert "Hook direction: reproduce only the observed reaction" in video_prompt
+    assert "follows the shopper's gaze left" in video_prompt
     assert "camera follows the shopper's gaze left" in video_prompt
     assert "coffee" not in image_prompt.lower() + video_prompt.lower()
     assert "cup" not in image_prompt.lower() + video_prompt.lower()
@@ -402,6 +827,18 @@ def test_plan_rejects_more_clips_than_distinct_analyzed_shots():
             analysis_fixture(), "creative direction", "product details",
             "living room", clip_count=4, seconds_per_clip=5,
         )
+
+
+def test_forty_thousand_character_direction_stays_out_of_compacted_video_prompt():
+    instructions = "x" * 40_000
+    plan = build_multiclip_plan(
+        analysis_fixture(), instructions, "A fixed product", "the analyzed scene", 1, 5, hook="custom",
+    )
+
+    assert plan.instructions == instructions
+    prompt = compile_video_prompt(plan, plan.clips[0])
+    assert len(prompt) <= 3_800
+    assert instructions not in prompt
 
 
 def test_original_null_source_segments_get_descriptive_titles():
@@ -542,9 +979,9 @@ def test_in_store_reaction_playbook_is_applied_to_hook_video_and_preflight_catch
         "warehouse retail aisle", 3, 5, hook="in_store_reaction",
     )
     hook_video = compile_video_prompt(plan, plan.clips[0])
-    assert "immediate, emotionally legible shopper reaction" in hook_video
-    assert "natural handheld smartphone movement" in hook_video
-    assert "one motivated gesture" in hook_video
+    assert "reproduce only the observed reaction" in hook_video
+    assert "match reference handheld pace" in hook_video.lower()
+    assert "preserve their order" in hook_video
     assert len(hook_video) <= 3_800
     assert "camera quickly reframes" in hook_video
     assert "camera quickly reframes" not in plan.clips[0].starting_image_prompt
@@ -814,7 +1251,7 @@ def test_other_hooks_keep_their_own_direction(hook):
     assert "In-Store Reaction ad:" not in prompt
 
 
-@pytest.mark.parametrize("hook", ["countdown_reveal", "gifting", "versus"])
+@pytest.mark.parametrize("hook", ["versus"])
 def test_other_formats_remain_runnable_without_reaction_specific_image_order(tmp_path, hook):
     data = analysis_fixture().model_dump()
     data["shots"][0]["creative_role"] = "Opening setup"
@@ -1366,17 +1803,140 @@ def test_resume_compacts_long_creative_plan_video_prompts_for_clips_two_to_four(
     assert len([call for call in kie.calls if call[0] == "image"]) == 2
 
 
+def _unique_oversized_product_facts() -> str:
+    return " ".join(
+        f"Confirmed specification detail {index:03d}: preserve unique geometry and material property code {index:03d}."
+        for index in range(120)
+    )
+
+
+def test_compiler_deduplicates_exact_product_facts_without_losing_the_specification():
+    plan = furglide_plan_with_long_provider_prompts()
+    repeated_fact = "Confirmed product specification: the integrated pouch has a reinforced lower seam."
+    plan.product_facts = (repeated_fact + " ") * 120
+
+    prompt = compile_video_prompt(plan, plan.clips[1])
+
+    assert repeated_fact in prompt
+    # The first copy follows the provider-facing field label; one bare copy remains.
+    assert prompt.count(repeated_fact) == 2
+    assert len(prompt) <= 3800
+
+
 def test_compiler_fails_actionably_when_essential_details_cannot_fit_provider_budget():
     plan = furglide_plan_with_long_provider_prompts()
-    plan.product_facts = "Unabridged confirmed product specification. " * 120
+    plan.product_facts = _unique_oversized_product_facts()
 
     with pytest.raises(ValueError, match="cannot be safely compacted.*Shorten the product specifications"):
         compile_video_prompt(plan, plan.clips[1])
 
 
+def test_motion_only_revision_compacts_duplicate_scene_context_and_preserves_drop_audio():
+    analysis = analysis_fixture()
+    plan = build_multiclip_plan(
+        analysis, "Recreate the store shot faithfully.",
+        "The exact brown babywearing hoodie from supplied product photos.",
+        "Target clothing store", 1, 4, hook="in_store_reaction",
+    )
+    plan.product_facts = "Product reference facts: " + (
+        "The brown babywearing hoodie has a soft fabric body, integrated front pouch, hood, drawstrings, and matching seams. " * 12
+    )
+    clip = plan.clips[0].model_copy(update={
+        "creative_role": "In-store reaction and reveal",
+        "visual_description": "Inside a Target clothing aisle, the shocked mother looks toward brown hoodie merchandise while holding her baby and iced coffee.",
+        "starting_state": "The mother is already shocked, holds an intact iced coffee cup, and securely supports the baby.",
+        "action": "At about one second, she releases the cup and it falls under gravity; camera pans right to reveal the brown hoodies.",
+        "ending_state": "The merchandise rack fills the frame; the mother and baby remain safe.",
+        "camera": "Realistic handheld smartphone framing and a smooth pan right toward the hoodie rack.",
+        "audio_mode": "enabled",
+        "audio_requested": True,
+        "audio_direction": "Retail ambience; realistic plastic cup impact and liquid spill synchronized with floor contact; no dialogue.",
+        "continuity_notes": ["Same mother and baby; preserve the Target aisle, brown hoodies, and handheld smartphone realism."],
+    })
+    plan = plan.model_copy(update={"clips": [clip]})
+    revision = (
+        "Fix ONLY the coffee-drop action in Clip 1. Preserve the approved starting image, same mother and baby, Target environment, realistic handheld movement, and rightward camera pan revealing the brown hoodies.\n\n"
+        "At approximately 1 second, the mother's fingers open and she accidentally releases the ENTIRE iced coffee cup. The cup, lid, straw, and liquid visibly fall together downward under gravity, completely separating from her hand.\n\n"
+        "The previous version incorrectly showed coffee pouring out while the cup remained in her hand. Do NOT repeat that mistake.\n\n"
+        "Include a realistic plastic-cup impact and liquid-spill sound synchronized with the cup hitting the floor.\n\n"
+        "The mother remains shocked, looks toward the merchandise, and securely supports the baby throughout. The camera then pans right and finishes with the brown hoodies clearly visible.\n\n"
+        "No extra gestures, cuts, dialogue, or changes to other clips."
+    )
+    revised = clip.model_copy(update={"video_prompt": clip.video_prompt + "\nClip-specific revision: " + revision})
+
+    prompt = compile_video_prompt(plan, revised)
+
+    assert len(prompt) <= 3800
+    assert "entire iced coffee cup" in prompt.lower()
+    assert "lid, straw, and liquid" in prompt.lower()
+    assert "fall together downward under gravity" in prompt.lower()
+    assert "completely separating from her hand" in prompt.lower()
+    assert "do not pour liquid while the cup is held" in prompt.lower()
+    assert "synchronized with floor contact" in prompt.lower() or "sync" in prompt.lower()
+    assert "already shocked" in prompt.lower()
+    assert "securely supports the baby" in prompt.lower()
+    assert "Target clothing aisle" in prompt or "Target clothing aisle".lower() in prompt.lower()
+    assert "pans right" in prompt.lower()
+    assert "brown hoodies" in prompt.lower()
+
+
+def test_final_prompt_compaction_keeps_clip2_insertion_requirements_across_revisions():
+    plan = build_multiclip_plan(
+        analysis_fixture(),
+        "Keep the outdoor babywearing demonstration faithful to the approved direction.",
+        "Brown integrated babywearing hoodie; preserve the supplied pouch construction and placement.",
+        "Outdoor daylight setting with a neutral background", 3, 5, hook="in_store_reaction",
+    )
+    clip = plan.clips[1].model_copy(update={
+        "source_start_seconds": None,
+        "source_end_seconds": None,
+        "creative_role": "Baby insertion demonstration",
+        "visual_description": "Outdoors, the same Asian mother holds the baby above the open integrated hoodie pouch.",
+        "starting_state": "The mother supports the baby above the open front carrier pouch; the baby is not yet seated.",
+        "action": "She visibly lowers the baby's hips and lower torso into the pouch while continuously supporting the baby's head, back, and body with both hands.",
+        "ending_state": "The baby is visibly seated inside the integrated hoodie pouch, not against its exterior.",
+        "camera": "Natural handheld smartphone medium shot in steady outdoor daylight.",
+        "audio_mode": "enabled",
+        "audio_requested": True,
+        "audio_direction": "Soft outdoor ambience and fabric rustle synchronized to the lowering and adjustment; no dialogue.",
+        "continuity_notes": ["Same Asian mother and baby; keep the approved outdoor environment and natural phone-camera look."],
+        "applied_user_changes": [
+            "Use the Asian mother and Asian baby.",
+            "Reconcile the current Creative Plan with the complete updated Creative Direction in confirmed context. Compare it with original_instructions, change only affected clips, and preserve all other approved plan details. Do not regenerate media.",
+        ],
+    })
+    plan = plan.model_copy(update={"product_facts": "Brown integrated babywearing hoodie with an open front pouch.", "clips": [plan.clips[0], clip, *plan.clips[2:]]})
+    revision = (
+        "Correct ONLY the baby's insertion into the integrated babywearing hoodie. Preserve the existing outdoor setting, same Asian mother and baby, brown hoodie, approved starting image, and natural smartphone filming style. "
+        "The mother begins holding the baby above and partially aligned with the open front carrier pouch. "
+        "She gently lowers the baby's hips and lower torso INTO the integrated pouch while continuously supporting the baby's body with both hands. "
+        "The pouch fabric naturally moves around the baby as the baby settles into the carrier. The mother then adjusts the fabric around the baby's body. "
+        "By the end of the clip, the baby must be visibly SEATED INSIDE the integrated hoodie pouch, matching the supplied product reference—not hanging against the exterior or being held in front of it. "
+        "Maintain believable anatomy, realistic fabric movement, appropriate support, and an unobstructed face. "
+        "MANDATORY: Show the complete downward insertion and final seated position. Do not skip the insertion, invent carrier mechanisms, change the outdoor environment, or introduce additional actions."
+    )
+    revised_clip = clip.model_copy(update={
+        "video_prompt": clip.video_prompt + "\nClip-specific revision: " + revision
+        + "\nClip-specific revision: Preserve the outdoor environment, continuous support, and seated-inside ending."
+    })
+    revised_plan = plan.model_copy(update={"clips": [plan.clips[0], revised_clip, *plan.clips[2:]]})
+
+    prompt = compile_video_prompt(revised_plan, revised_clip)
+
+    assert len(prompt) <= 3800
+    assert "visibly lowers" in prompt.lower() and "continuously supporting" in prompt.lower()
+    assert "seated inside the integrated hoodie pouch" in prompt.lower()
+    assert "not against its exterior" in prompt.lower()
+    assert "do not skip the insertion" in prompt.lower()
+    assert "outdoor daylight" in prompt.lower()
+    assert "synchronized to the lowering" in prompt.lower() or "synchronize each selected native sound" in prompt.lower()
+    assert "reconcile the current creative plan" not in prompt.lower()
+    assert "do not regenerate media" not in prompt.lower()
+
+
 def test_uncompactable_plan_is_rejected_before_any_provider_operation(tmp_path):
     plan = furglide_plan_with_long_provider_prompts()
-    plan.product_facts = "Unabridged confirmed product specification. " * 120
+    plan.product_facts = _unique_oversized_product_facts()
     kie = FakeKie()
 
     with pytest.raises(ValueError, match="cannot be safely compacted"):
@@ -1654,6 +2214,7 @@ def test_masked_edit_compiles_environment_identity_product_and_scene_roles(
     result = run_masked_image_edit(
         plan, target, scene_base, mask, [product], [identity],
         tmp_path / "masked-output", client,
+        instructions="Replace only her clothing with a forest-green cardigan.",
     )
 
     request = next(call for call in client.calls if call[0] == "masked")
@@ -1663,6 +2224,9 @@ def test_masked_edit_compiles_environment_identity_product_and_scene_roles(
     assert "first input is the selected scene base and environment only" in request[1].lower()
     assert "identity only" in request[1].lower()
     assert "ignore that reference's pose, expression, wardrobe, and environment" in request[1].lower()
+    assert "user-requested masked change" in request[1].lower()
+    assert "replace only her clothing with a forest-green cardigan." in request[1].lower()
+    assert "only within the transparent editable mask" in request[1].lower()
     assert "product appearance only" in request[1].lower()
     assert state.lower() in request[1].lower()
     assert result.is_file()
@@ -1698,3 +2262,4 @@ def test_saved_mask_lookup_matches_source_hash_for_environment_first_scene_bases
         "clip-02-mask.png", "clip-03-mask.png", "clip-04-mask.png",
     ]
     assert find_saved_mask_for_scene(outputs, tmp_path / "unrelated.png") is None
+    assert find_saved_mask_for_scene(outputs, sources[0], target="different edit target") is None

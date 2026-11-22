@@ -9,7 +9,15 @@ from pathlib import Path
 import httpx
 
 from ecom_video.config import require_key
-from ecom_video.creative_playbook import CONTINUITY_RULES, STARTING_STATE_RULES, format_lesson_reminders
+from ecom_video.creative_playbook import (
+    COUNTDOWN_REVEAL_PLAYBOOK,
+    GIFTING_UNBOXING_PLAYBOOK,
+    GIFTING_UNBOXING_REFERENCE_RULES,
+    CONTINUITY_RULES,
+    REFERENCE_RECREATION_RULES,
+    STARTING_STATE_RULES,
+    format_lesson_reminders,
+)
 from ecom_video.models import AnalysisResult, hook_direction
 
 MODEL = "gpt-5.4-mini-2026-03-17"
@@ -38,10 +46,12 @@ SCHEMA = {
                 "character_groups": {"type": "array", "items": {"type": "string"}},
                 "continuity_notes": {"type": "array", "items": {"type": "string"}},
                 "uncertainties": {"type": "array", "items": {"type": "string"}},
+                "source_observation": {"type": "string"},
+                "applied_user_changes": {"type": "array", "items": {"type": "string"}},
             },
             "required": ["index", "start_seconds", "end_seconds", "creative_role", "visual_description",
                          "starting_state", "action", "ending_state", "target_duration_seconds", "edit_duration_seconds", "camera", "product_interaction",
-                         "hook_or_payoff", "audio_requested", "audio_direction", "continuity_group", "character_groups", "continuity_notes", "uncertainties"],
+                         "hook_or_payoff", "audio_requested", "audio_direction", "continuity_group", "character_groups", "continuity_notes", "uncertainties", "source_observation", "applied_user_changes"],
         }},
     }, "required": ["summary", "questions", "shots"],
 }
@@ -85,11 +95,11 @@ def analyze_reference(
             target_note = (
                 f"Requested target output: up to {clip_count} clips. The creator selected Director decides for duration; choose each target_duration_seconds (1-15s) and edit_duration_seconds individually based on action completion. Do not apply a fixed duration to every shot. "
             )
-        elif hook in {"in_store_reaction", "wet_works"}:
+        elif hook in {"in_store_reaction", "wet_works", "countdown_reveal", "gifting"}:
             target_note = (
-                f"Requested target clip count {clip_count} is a maximum, not a required count; the interface duration {seconds_per_clip}s is a fallback only. "
-                "Choose one generated clip per meaningful cut/action and set each target_duration_seconds (1-15s) and edit_duration_seconds "
-                "(estimated trimmed use in the final edit) separately. Never equate source timestamps, generated duration, and final edit duration. "
+                f"Requested clip count {clip_count} is a preference and cannot remove or merge a source scene. Preserve one generated clip per distinct source scene. "
+                f"Use the {seconds_per_clip}s interface duration only as a fallback; set each target_duration_seconds (1-15s) and edit_duration_seconds "
+                "to approximate that source scene's duration separately. Never equate absolute source timestamps with target or final edit duration. "
             )
         else:
             target_note = (
@@ -103,30 +113,62 @@ def analyze_reference(
         if reference_has_audio else
         "Reference audio stream metadata: absent or unavailable. Select only natural sounds supported by visible physical actions and creator instructions. "
     )
+    selected_hook_direction = (
+        "In-Store Reaction reference recreation: the observed source sequence controls; include only its actual beats."
+        if hook in {"in_store_reaction", "wet_works"} else hook_direction(hook)
+    )
     in_store_analysis_guidance = ""
     if hook in {"in_store_reaction", "wet_works"}:
         in_store_analysis_guidance = (
-            "For In-Store Reaction, keep the immediate reaction, motivated gesture, and quick product-revealing reframe "
-            "together in one target clip when the reference and available duration support it. Derive pacing from the reference; "
-            "do not split reaction gestures without a genuinely distinct scene. Allocate later clips to product-specific actions "
-            "that advance the story."
+            f"{REFERENCE_RECREATION_RULES} "
+            "Analyze every distinct source scene independently from opening through ending, retaining its absolute source timestamps, "
+            "frame-zero composition, ordered within-shot actions and timing, camera changes, and ending state. Do not impose a format beat "
+            "that is absent from this reference. If a scene combines reaction and reveal, preserve that continuous source shot. "
+            "Treat requested clip count as a generation preference only; never omit or merge observed source scenes to meet it. "
+            "Record source observations in the scene and action fields; apply only requested substitutions to their named people, products, "
+            "or environments. Put a concise faithful account of the unmodified source scene in source_observation, and list only explicit "
+            "creator changes affecting that scene in applied_user_changes. Keep those source facts separate from the target shot fields. "
+            "Distinguish observations from uncertainty."
+        )
+    reveal_analysis_guidance = ""
+    if hook == "countdown_reveal":
+        reveal_analysis_guidance = (
+            f"{REFERENCE_RECREATION_RULES} {COUNTDOWN_REVEAL_PLAYBOOK} "
+            "For every shot, identify the visible initial and ending states, source timestamp, actual concealment or uncertainty, "
+            "cover shape/size/material and support when visible, reveal performer and grip/action, whether the reveal is physical or by edit, "
+            "reveal start/completion timing, and what immediately follows. Keep reveal and concealment in one clip when they are one continuous source shot. "
+            "Preserve every distinct source scene and order even when requested clip count is lower; the count is a preference. "
+            "Never infer a literal 3-2-1 countdown from the format name. If the source has no physical unveiling, do not invent one. "
+            "Record the original scene in source_observation and only explicit creator substitutions in applied_user_changes."
+        )
+    gifting_analysis_guidance = ""
+    if hook == "gifting":
+        gifting_analysis_guidance = (
+            f"{REFERENCE_RECREATION_RULES} {GIFTING_UNBOXING_PLAYBOOK} {GIFTING_UNBOXING_REFERENCE_RULES} "
+            "Analyze every distinct source scene and preserve its source timestamp, opening composition, camera, environment, "
+            "people/animal identities, package type and exact sealed/open/partial/empty state, package artwork, inserts, "
+            "product orientation and stage, hand/tool placement, grip, contact, ordered actions and approximate timing, "
+            "ending state, captions, visible audio cues, and continuity. State opening and ending physical states explicitly. "
+            "For packaging, explain exactly how it is opened and how the product emerges from its plausible position. "
+            "Keep observed source facts in source_observation; put only explicit requested substitutions affecting that shot in applied_user_changes. "
+            "Do not impose the six-stage framework or merge/drop source scenes to meet requested clip count. Do not infer delight, "
+            "a gift exchange, product capabilities, certification, safety, licensing, or retail affiliation."
         )
     content: list[dict] = [{"type": "input_text", "text": (
-        "Analyze this complete short-form product video as reference for an original execution. "
+        "Analyze this complete short-form product video as the blueprint for a faithful reference recreation, applying only the creator's explicit changes. "
         "Identify a small set of distinct meaningful shots with approximate absolute source-video timestamps, creative role, "
         "starting state, concrete physical action, ending state or payoff, camera framing/movement, product interaction, "
         "and a per-shot native-audio decision. Set audio_requested true only when synchronized natural sound materially supports an audible action, reaction, mechanism, or ambience; set it false for static shots, no useful sound, or explicit silence. In audio_direction name only plausible sounds and their physical sync points. Never invent dialogue or music unless the creator requests it, and never claim sound is present until the provider output is verified. "
         "continuity group/anchors, and uncertainties. Do not invent product capabilities. Return targeted questions only "
-        "when missing facts materially affect physical plausibility or fidelity. Preserve structure, not exact footage. "
+        "when missing facts materially affect physical plausibility or fidelity. "
         "Treat the complete creator instructions as authoritative. Keep the summary concise (about 700 characters) "
         "and use it for shared requirements such as product identity, character appearance, environment, lighting, "
         "continuity, realism, and prohibitions. Every timestamp is measured from the start of the source video, "
         "never the duration of a generated target clip. Match intervals to timestamped frame evidence. Do not reuse "
         "one interval for distinct scenes. Only give a source interval when a shot corresponds to visible reference footage. "
         "For a shot created primarily from written instructions with no exact matching segment, set both timestamps to null. "
-        "Keep all intervals within the source-video duration. Adapt each shot's visual description, action, and product interaction "
-        "to the requested execution; use source footage only for allowed framing and rhythm. Do not carry source-only "
-        "subjects or actions into the target shot when the creator instructions replace them. Keep each shot field "
+        "Keep all intervals within the source-video duration. Preserve each observed shot except where an explicit creator change applies; "
+        "scope each change to its requested target. Keep each shot field "
         "concise and preserve its scene-specific requirements in the relevant fields. Give every shot a purposeful role "
         "in a progression such as hook, demonstration, or reaction when the source and brief support it. Avoid repetitive "
         "product shots. Specify visible states before and after each action, and give reactions a believable visual payoff. "
@@ -138,15 +180,15 @@ def analyze_reference(
         "anchors in continuity_notes, and the image workflow will pass the earliest established starting image as the identity reference. "
         "Keep movement physically plausible and preserve visible product details.\n"
         f"{reference_audio_note}Creator instructions: {instruction}\nProduct facts (may be incomplete): {product_facts}\n"
-        f"Selected hook direction: {hook_direction(hook)}\n"
+        f"Selected hook direction: {selected_hook_direction}\n"
         "Make each shot's creative_role distinct and explain its unique contribution to one coherent advertisement. "
         "Do not repeat the same product pose. For supplied imagery, treat visible product details as authoritative.\n"
         f"{duration_note}{target_note}Representative frames span the full source video ({len(frames)} total). "
         "Cover meaningful scenes from the opening through the actual final scene and use the ending for a real payoff when present; "
         f"do not stop analysis early or omit ending footage to match target clip count. {in_store_analysis_guidance} "
         "For each scene describe the exact camera movement, physical interaction, mechanism and causal result. "
-        "Preserve reference visual rhythm and mechanics while describing original target footage. "
-        f"{STARTING_STATE_RULES} {CONTINUITY_RULES} {format_lesson_reminders(hook)} "
+        "Preserve reference visual rhythm, actions, and mechanics in target footage. "
+        f"{reveal_analysis_guidance} {gifting_analysis_guidance} {STARTING_STATE_RULES} {CONTINUITY_RULES} {format_lesson_reminders(hook)} "
         "Keep starting_state limited to what is visibly true at frame zero; put subsequent movement only in action."
     )}]
     for frame in frames:
@@ -194,7 +236,7 @@ def direct_original(instructions: str, answers: list[str], hook: str = "recommen
         json={
             "model": MODEL,
             "input": [{"role": "user", "content": [{"type": "input_text", "text": (
-                "Act as a practical ecommerce commercial director. Interview only for missing details that affect product identity, physical plausibility, safety, or the visual payoff. Never repeat a fact or question present in the brief or previous answers. Treat 'you decide' and 'surprise me' as permission to choose and state a reasonable assumption. Packaging questions are only relevant when packaging appears. Ask at most five concise questions in one turn. If critical information is still missing, return questions and an empty shots array. Otherwise choose a purposeful shot count from distinct actions/cuts, typically three to six without padding to a fixed count. For every shot specify visible starting state, ordered physical action, ending payoff, camera movement, environment, product interaction, continuity anchors, audio_requested, audio_direction, target_duration_seconds, and edit_duration_seconds. Choose per-shot durations when the creator requests Director decides; otherwise use null when the creator has not specified a duration. Keep beginning and ending states physically possible. Never invent product functionality. Plan only useful, natural, synchronized sound; spoken dialogue requires an explicit request, and music is not generated by this workflow. Output remains silent for shots where no native sound is selected. Source times must be null. "
+                "Act as a practical ecommerce commercial director. Interview only for missing details that affect product identity, physical plausibility, safety, or the visual payoff. Never repeat a fact or question present in the brief or previous answers. Treat 'you decide' and 'surprise me' as permission to choose and state a reasonable assumption. Packaging questions are only relevant when packaging appears. Ask at most five concise questions in one turn. If critical information is still missing, return questions and an empty shots array. Otherwise choose a purposeful shot count from distinct actions/cuts, typically three to six without padding to a fixed count. For every shot specify visible starting state, ordered physical action, ending payoff, camera movement, environment, product interaction, continuity anchors, audio_requested, audio_direction, target_duration_seconds, and edit_duration_seconds. Choose per-shot durations when the creator requests Director decides; otherwise use null when the creator has not specified a duration. Keep beginning and ending states physically possible. Never invent product functionality. Plan only useful, natural, synchronized sound; spoken dialogue requires an explicit request, and music is not generated by this workflow. Output remains silent for shots where no native sound is selected. Source times must be null, source_observation must be empty, and applied_user_changes must contain only explicit changes from the brief. "
                 f"{STARTING_STATE_RULES} {CONTINUITY_RULES} {format_lesson_reminders(hook)} Keep starting_state limited to frame zero and put later movements only in action.\n"
                 f"{in_store_director_guidance}\n"
                 f"Hook: {hook_direction(hook)}\nInitial brief: {instructions}\nPrevious answers: {json.dumps(answers)}"
@@ -216,13 +258,20 @@ direct_original.last_usage = {}
 
 def revise_creative_plan(instruction: str, plan: dict, confirmed_context: dict) -> dict:
     """Revise only the requested shots while returning a complete structured plan."""
+    preservation_guidance = (
+        f"{REFERENCE_RECREATION_RULES} Preserve each source scene boundary, order, source timestamp, target duration, "
+        "opening/ending state, and physical action unless the requested change directly affects it. "
+        "Keep original observations distinct from the user's requested changes. "
+        if confirmed_context.get("mode") == "reference" and confirmed_context.get("hook") in {"in_store_reaction", "wet_works", "gifting"} else ""
+    )
     response = httpx.post(
         URL,
         headers={"Authorization": f"Bearer {require_key('OPENAI_API_KEY')}"},
         json={"model": MODEL,
               "input": [{"role": "user", "content": [{"type": "input_text", "text": (
                   "Revise this existing ecommerce video plan. Return every shot in the same order and with the same indices. "
-                  "Change only the shots required by the user's request; preserve all other shots exactly. Preserve the original concept, confirmed product specifications, hook unless explicitly changed, prior interview answers, continuity facts, target_duration_seconds, edit_duration_seconds, and audio_requested unless the requested shot change affects its audible actions. Do not restart the interview or invent product features. Each shot needs its creative role, visible scene, starting state, concrete physical action, ending payoff, camera, product interaction, audio_requested, audio_direction, continuity group and notes, and source timestamps when already present. Plan only useful natural sounds and synchronize them with physical actions; do not invent dialogue or music. "
+                  "Change only the shots required by the user's request; preserve all other shots exactly. Preserve the original concept, confirmed product specifications, hook unless explicitly changed, prior interview answers, continuity facts, source_observation, previously applied_user_changes, target_duration_seconds, edit_duration_seconds, and audio_requested unless the requested shot change affects its audible actions. Do not restart the interview or invent product features. Each shot needs its creative role, visible scene, starting state, concrete physical action, ending payoff, camera, product interaction, audio_requested, audio_direction, continuity group and notes, and source timestamps when already present. Plan only useful natural sounds and synchronize them with physical actions; do not invent dialogue or music. "
+                  f"{preservation_guidance}"
                   "List only intentionally changed shot indices in changed_shot_indices. Keep summary coherent.\n"
                   f"Confirmed context: {json.dumps(confirmed_context, ensure_ascii=False)}\n"
                   f"Current plan: {json.dumps(plan, ensure_ascii=False)}\n"

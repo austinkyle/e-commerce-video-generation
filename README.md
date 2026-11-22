@@ -10,6 +10,7 @@ A local-first creative production tool for turning product ideas or reference vi
 - **Original Concept:** describe a new idea without a reference video or product photo. The Creative Director asks adaptive follow-up questions, records answers, and builds a structured multi-clip plan.
 - **Creative planning:** select or request a hook, refine the saved plan in natural language, and review clip roles, actions, framing, continuity, and cost estimates.
 - **In-Store Reaction hook:** opens on an immediate shopper reaction, escalates with a product-motivated gesture, and quickly reframes to reveal the product. Reactions vary with the concept; dropping a drink is optional. Later clips are selected for the product's actual demonstration and story.
+- **Gifting / Unboxing format:** recreate the reference's actual package state, opening and removal actions, product demonstration, identities, environments, and payoff. The story stays faithful to its source without requiring a gift exchange or a fixed shot template. See the [Gifting / Unboxing V1 playbook](docs/playbooks/gifting-unboxing-v1.md).
 - **Image and video generation:** create starting images with Kie Sunburst and vertical clips with the configured Kie video model. Each clip has Auto, Enabled, and Silent audio modes; native audio is requested or suppressed per clip and checked in the exported file. User product photos and selected continuity images can guide image generation.
 - **Starting-image review:** optionally pause after image preparation to inspect all planned images, regenerate only a selected image, and approve the set before videos are submitted. When review is off, image generation proceeds directly into video generation.
 - **Recovery and history:** resume interrupted jobs using saved assets and provider task IDs; regenerate individual clips while retaining earlier versions.
@@ -27,6 +28,7 @@ The interface uses the Abyssal Teal dark design. New clip plans default to Auto,
 - Jobs, project histories, source inputs, generated images and videos, and usage records are stored as local files. No application database or cloud hosting is required.
 
 For where reusable generation rules, project records, and editing standards belong, see [GENERATION-KNOWLEDGE-MAP.md](GENERATION-KNOWLEDGE-MAP.md).
+The Gifting / Unboxing format rules are documented separately from runtime code and are registered through the existing `gifting` creative-format hook.
 
 ## Requirements and setup
 
@@ -36,9 +38,11 @@ For where reusable generation rules, project records, and editing standards belo
 From the project directory:
 
 ```sh
-uv sync
+uv sync --extra auto-mask
 cp .env.example .env
 ```
+
+Masked image edits use local Grounding DINO and SAM 2 models. Their weights download on first use (about 0.8 GB total); segmentation runs on this Mac and adds no per-edit segmentation charge. Standard image and video provider costs remain unchanged.
 
 Add `OPENAI_API_KEY` and `KIE_API_KEY` to the local `.env` only when needed. Keep real keys there; `.env` and `.env.*` are excluded from Git while `.env.example` contains blank values. `APP_DATA_DIR` optionally changes the data root; it defaults to `data/` relative to the project directory.
 

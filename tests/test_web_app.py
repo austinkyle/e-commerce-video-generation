@@ -205,6 +205,51 @@ def test_refine_plan_preserves_context_and_unaffected_shots_without_reanalysis(t
     assert len(director_calls) == 2
 
 
+def test_in_store_reference_plan_revision_keeps_source_observation_and_change_log(tmp_path):
+    from ecom_video.workflow import MultiClipPlan
+
+    service = service_factory(tmp_path)
+    ready = create_ready_job(service, tmp_path)
+    job_id = ready["id"]
+    job = service._read(job_id)
+    analysis = AnalysisResult.model_validate(job["analysis"])
+    analysis.shots[0].source_observation = "Original source: the shopper wears a tan coat and lifts the product from the shelf."
+    analysis.shots[0].applied_user_changes = ["Keep the original action; make the shopper's coat green."]
+    plan = MultiClipPlan.model_validate_json(job["plan_json"])
+    plan = plan.model_copy(update={"hook": "in_store_reaction", "clips": [
+        plan.clips[0].model_copy(update={
+            "source_observation": analysis.shots[0].source_observation,
+            "applied_user_changes": analysis.shots[0].applied_user_changes,
+        }), *plan.clips[1:],
+    ]})
+    service._update(job_id, lambda data: data.update(analysis=analysis.model_dump(mode="json"), plan_json=plan.model_dump_json(), hook="in_store_reaction"))
+    before = service._read(job_id)
+    before_plan = MultiClipPlan.model_validate_json(before["plan_json"])
+    before_source = AnalysisResult.model_validate(before["analysis"]).shots[0].source_observation
+
+    def reviser(instruction, current_plan, context):
+        reviser.last_usage = {"input_tokens": 20, "output_tokens": 20}
+        shots = [dict(shot) for shot in before["analysis"]["shots"]]
+        shots[0]["action"] = "The shopper lifts the product and smiles; keep the source camera move."
+        return {"summary": "Revised only the shopper's jacket color.", "changed_shot_indices": [1], "shots": shots}
+    reviser.last_usage = {}
+    service.plan_reviser = reviser
+
+    service.refine_plan(job_id, "Make only the shopper's coat green.")
+    after = MultiClipPlan.model_validate_json(service._read(job_id)["plan_json"])
+    prompt = __import__("ecom_video.workflow", fromlist=["compile_video_prompt"]).compile_video_prompt(after, after.clips[0])
+
+    assert after.hook == "in_store_reaction"
+    assert after.clips[0].source_observation == before_source
+    assert after.clips[0].applied_user_changes == [
+        "Keep the original action; make the shopper's coat green.",
+        "Make only the shopper's coat green.",
+    ]
+    assert after.clips[1:] == before_plan.clips[1:]
+    assert "Original source: the shopper wears a tan coat" in prompt
+    assert "Explicit changes authorized for this scene" in prompt
+
+
 def test_refine_plan_requires_ready_job_and_renders_controls():
     from ecom_video.web_app import WEB_ROOT
     html = (WEB_ROOT / "index.html").read_text()
@@ -212,6 +257,84 @@ def test_refine_plan_requires_ready_job_and_renders_controls():
     assert 'id="refinePlanInput"' in html and 'id="updatePlanButton"' in html
     assert '"/refine"' not in script  # endpoint uses the stable per-job route template below
     assert "/refine`" in script
+
+
+def test_existing_project_creative_direction_revision_persists_and_preserves_media(tmp_path):
+    from ecom_video.workflow import MultiClipPlan, compile_video_prompt
+
+    service = service_factory(tmp_path)
+    ready = create_ready_job(service, tmp_path)
+    job_id = ready["id"]
+    original_direction = service._read(job_id)["instructions"]
+    instruction = "Baby stays physically seated inside the integrated hoodie pouch throughout Clips 2 and 3."
+    revised_direction = original_direction + "\n\n" + instruction
+    service._update(job_id, lambda data: data.update(
+        status="awaiting_image_review", stage="awaiting_image_review",
+        clips=[{**clip, "current_starting_image_asset": f"approved-image-{clip['index']}",
+                "starting_image_history": [{"version": 1, "asset_id": f"approved-image-{clip['index']}", "created_at": "2026-01-01T00:00:00+00:00"}],
+                "versions": [{"version": 1, "starting_image_asset": f"approved-image-{clip['index']}", "video_asset": f"approved-video-{clip['index']}", "duration_seconds": 5, "revision": "approved", "actual_kie_usd_equivalent": "0.12"}]}
+               for clip in data["clips"]],
+    ))
+    before = service._read(job_id)
+    before_media = [(clip["current_starting_image_asset"], clip["starting_image_history"], clip["versions"]) for clip in before["clips"]]
+    before_kie_charges = before["charges"]["kie_usd_equivalent"]
+
+    def reviser(_instruction, _plan, context):
+        assert context["original_instructions"] == original_direction
+        assert context["updated_creative_direction"] == revised_direction
+        reviser.last_usage = {"input_tokens": 100, "output_tokens": 20}
+        shots = [shot.model_dump(mode="json") for shot in AnalysisResult.model_validate(before["analysis"]).shots]
+        shots[1].update(
+            starting_state="The mother holds the baby securely above the open integrated hoodie pouch.",
+            action="The mother visibly lowers the baby into the open pouch while continuously supporting the baby's body.",
+            ending_state="The baby is properly seated inside the integrated carrier.",
+            product_interaction="The baby is supported and seated inside the integrated hoodie pouch; no other mechanism is used.",
+        )
+        shots[2].update(
+            starting_state="The baby is correctly seated inside the hoodie pouch.",
+            action="The mother walks through the Christmas market while the baby remains seated inside the hoodie pouch.",
+            ending_state="The baby remains correctly seated inside the hoodie pouch.",
+            product_interaction="The baby remains supported inside the integrated hoodie pouch.",
+        )
+        return {"summary": "The revised clips keep the baby correctly supported in the integrated pouch.",
+                "changed_shot_indices": [2, 3], "shots": shots}
+    reviser.last_usage = {}
+    service.plan_reviser = reviser
+
+    result = service.refine_plan(job_id, "Update the Creative Plan to match the revised Creative Direction.", updated_creative_direction=revised_direction)
+    saved = service._read(job_id)
+    plan = MultiClipPlan.model_validate_json(saved["plan_json"])
+    assert result["status"] == "awaiting_image_review"
+    assert saved["instructions"] == revised_direction == plan.instructions
+    assert result["creative_direction_revision"]["affected_clip_indices"] == [2, 3]
+    assert "Affected clips: 2, 3" in result["message"]
+    assert "properly seated inside" in compile_video_prompt(plan, plan.clips[1], product_reference_count=1)
+    assert "remains correctly seated" in compile_video_prompt(plan, plan.clips[2], product_reference_count=1)
+    assert all(plan.clips[index - 1].starting_image_prompt for index in (2, 3))
+    assert "above the open integrated hoodie pouch" in plan.clips[1].starting_image_prompt.lower()
+    assert "correctly seated inside the hoodie pouch" in plan.clips[2].starting_image_prompt.lower()
+    assert [(clip["current_starting_image_asset"], clip["starting_image_history"], clip["versions"]) for clip in saved["clips"]] == before_media
+    assert saved["charges"]["kie_usd_equivalent"] == before_kie_charges
+    reopened = LocalJobService(tmp_path / "app-data", analyzer=service.analyzer, director=service.director, client_factory=service.client_factory, frame_sampler=service.frame_sampler, video_probe=service.video_probe)
+    restored = reopened.get_job(job_id)
+    assert restored["instructions"] == revised_direction
+    assert restored["creative_direction_revision"]["affected_clip_indices"] == [2, 3]
+
+
+def test_creative_direction_editor_is_available_for_saved_projects():
+    from ecom_video.web_app import WEB_ROOT
+    html = (WEB_ROOT / "index.html").read_text()
+    script = (WEB_ROOT / "app.js").read_text()
+    assert 'id="editCreativeDirectionButton"' in html
+    assert 'id="saveCreativeDirectionButton"' in html
+    assert 'id="cancelCreativeDirectionButton"' in html
+    assert 'id="creativeDirectionError" class="creative-direction-error" role="alert"' in html
+    assert "/creative-direction`" in script
+    assert "$('instructions').readOnly = busy || Boolean(state.job && state.job.status !== 'draft' && !state.editingCreativeDirection);" in script
+    assert "pastedText.replace(/\\r\\n?/g, '\\n').length" in script
+    assert "pastedLength > remaining" in script
+    assert "event.preventDefault();" in script
+    assert "no text was pasted" in script
 
 
 def create_ready_job(service: LocalJobService, tmp_path: Path) -> dict:
@@ -331,6 +454,38 @@ def test_reference_draft_selection_reaches_director_and_saved_plan(tmp_path, hoo
     assert ready["hook"] == hook
     assert seen == [hook]
     assert saved_plan.hook == hook
+
+
+@pytest.mark.parametrize("hook", ["wet_works", "countdown_reveal", "gifting"])
+def test_reference_format_plan_keeps_all_detected_scenes_even_when_clip_count_is_lower(tmp_path, hook):
+    analysis = sample_analysis()
+    extra = analysis.shots[-1].model_copy(deep=True)
+    extra.index = 4
+    extra.start_seconds = 6
+    extra.end_seconds = 8
+    extra.creative_role = "Distinct final payoff"
+    extra.action = "The shopper places the product on the counter."
+    analysis.shots.append(extra)
+
+    def analyzer(frames, instructions, product_facts, **kwargs):
+        analyzer.last_usage = {"input_tokens": 100, "output_tokens": 10}
+        return analysis
+    analyzer.last_usage = {}
+    service = service_factory(tmp_path)
+    service.analyzer = analyzer
+    service._spawn = lambda target, *args: target(*args)
+    draft = service.save_draft({
+        "mode": "reference", "hook": hook, "instructions": "Recreate the supplied reference.",
+        "clip_count": "2", "seconds_per_clip": "5", "review_images_before_video": "true", "product_asset_ids": "[]",
+    }, {"reference_video": [("reference.mp4", b"reference")]})
+    ready = service.analyze_draft(draft["id"])
+    from ecom_video.workflow import MultiClipPlan
+    plan = MultiClipPlan.model_validate_json(service._read(draft["id"])["plan_json"])
+
+    assert ready["status"] == "ready"
+    assert len(ready["clips"]) == len(plan.clips) == 4
+    assert [(clip.source_start_seconds, clip.source_end_seconds) for clip in plan.clips] == [(0, 2), (2, 4), (4, 6), (6, 8)]
+    assert plan.clips[-1].action == "The shopper places the product on the counter."
 
 
 def test_explicit_saved_format_wins_over_legacy_instruction_inference(tmp_path):
@@ -458,10 +613,10 @@ def test_job_analysis_returns_plan_estimate_and_redacts_local_paths(tmp_path):
     assert job["inputs"][0]["role"] in {"reference_video", "product_reference"}
 
 
-def test_twenty_thousand_character_instruction_reaches_analysis_and_persists_intact(tmp_path):
+def test_forty_thousand_character_instruction_reaches_analysis_and_persists_intact(tmp_path):
     core = "Shared requirements: same character, product details, and lighting.\n\n"
-    core += "Long creative detail. " * ((19_997 - len(core)) // len("Long creative detail. "))
-    core += "x" * (19_997 - len(core))
+    core += "Long creative detail. " * ((39_997 - len(core)) // len("Long creative detail. "))
+    core += "x" * (39_997 - len(core))
     instructions = " " + core + " \n"
     observed = {}
 
@@ -482,25 +637,37 @@ def test_twenty_thousand_character_instruction_reaches_analysis_and_persists_int
             break
         time.sleep(0.01)
 
-    assert len(instructions) == 20_000
+    assert len(instructions) == 40_000
     assert observed["instructions"] == instructions
     assert service._read(job["id"])["instructions"] == instructions
+    assert service_factory(tmp_path).get_job(job["id"])["instructions"] == instructions
 
 
-def test_creative_instructions_over_twenty_thousand_characters_are_rejected(tmp_path):
+def test_creative_instructions_over_forty_thousand_characters_are_rejected(tmp_path):
     service = service_factory(tmp_path)
-    with pytest.raises(AppError, match="20,000"):
-        service.create_job("reference.mp4", b"video", [], "x" * 20_001)
+    with pytest.raises(AppError, match="40,000"):
+        service.create_job("reference.mp4", b"video", [], "x" * 40_001)
 
 
-def test_creative_instructions_ui_advertises_twenty_thousand_character_limit():
+def test_creative_instruction_length_matches_textarea_newline_normalization():
+    from ecom_video.workflow import creative_instruction_length
+
+    assert creative_instruction_length("a\r\nb\rc\n") == 6
+    assert creative_instruction_length("x\r\n" * 20_000) == 40_000
+    assert creative_instruction_length("x\r\n" * 20_000 + "x") == 40_001
+
+
+def test_creative_instructions_ui_advertises_forty_thousand_character_limit():
     from ecom_video.web_app import WEB_ROOT
 
     html = (WEB_ROOT / "index.html").read_text()
     script = (WEB_ROOT / "app.js").read_text()
-    assert 'maxlength="20000"' in html
-    assert "0 / 20,000" in html
-    assert "MAX_INSTRUCTION_LENGTH = 20_000" in script
+    assert 'id="instructions" name="instructions" rows="5" maxlength="40000"' in html
+    assert 'id="characterCount">0 / 40,000' in html
+    assert 'id="interviewAnswer" rows="3" required maxlength="40000"' in html
+    assert 'id="refinePlanInput" rows="3" maxlength="40000"' in html
+    assert "MAX_INSTRUCTION_LENGTH = 40_000" in script
+    assert "40,000 characters or fewer" in script
 
 
 def test_project_names_have_mode_appropriate_defaults_and_rename_survives_restart(tmp_path):
@@ -1215,9 +1382,16 @@ def test_starting_image_review_interface_is_a_single_approval_screen_with_select
     assert 'creative_role || clip.title' in script
     assert 'Regenerate Image · ~$0.03' in script
     assert 'imageChecks.length !== (job.clips || []).length' in script
-    assert 'Optional: preserve a scene with masked editing' in script
+    assert 'Optional masked edit · mask created automatically' in script
     assert 'Generate Masked Candidate · ~$0.05' in script
+    assert "maskedButton.textContent = 'Preparing Mask…'" in script
+    assert 'Creating the mask locally. First use may take a moment' in script
+    assert 'aria-live' in script and 'Masked edit failed:' in script
+    assert "if (!instructions)" in script
     assert 'body instanceof FormData' in script
+    assert 'identifies and segments the requested object locally' in script
+    assert 'Advanced: use an existing mask file' in script
+    assert "Image adjustment for standard regeneration or masked edit for clip" in script
     assert 'job.scene_base_images' in script
     assert 'preferring approved anchors; provisional images are not approved automatically' in script
 
@@ -1274,7 +1448,7 @@ def test_masked_edit_is_invokable_through_normal_image_regeneration_route(tmp_pa
         body = (
             f"--{boundary}\r\nContent-Disposition: form-data; name=\"edit_mode\"\r\n\r\nmasked\r\n"
             f"--{boundary}\r\nContent-Disposition: form-data; name=\"base_source\"\r\n\r\nenvironment:3:0\r\n"
-            f"--{boundary}\r\nContent-Disposition: form-data; name=\"instructions\"\r\n\r\nKeep the same mother and baby, now smiling softly.\r\n"
+            f"--{boundary}\r\nContent-Disposition: form-data; name=\"instructions\"\r\n\r\nReplace only the mother's jacket with a forest-green cardigan.\r\n"
             f"--{boundary}\r\nContent-Disposition: form-data; name=\"mask_image\"; filename=\"mask.png\"\r\nContent-Type: image/png\r\n\r\n"
         ).encode() + mask + f"\r\n--{boundary}--\r\n".encode()
         conn = HTTPConnection("127.0.0.1", server.server_port, timeout=3)
@@ -1284,12 +1458,96 @@ def test_masked_edit_is_invokable_through_normal_image_regeneration_route(tmp_pa
         assert response.status == 202 and result["status"] == "awaiting_image_review"
         edit = next(call for call in client.calls if call[0] == "edit")
         assert edit[2][0] == f"https://fake.test/{images[2].name}"
+        assert "user-requested masked change (apply only within the transparent editable mask): replace only the mother's jacket with a forest-green cardigan." in edit[1].lower()
         assert "character reference is for identity only" in edit[1].lower()
         assert "product reference is for product appearance only" in edit[1].lower()
         assert edit[2][-1] == f"https://fake.test/{Path(plan.product_references[0]).name}"
         updated = service.get_job(ready["id"])
         assert len(updated["clips"][2]["starting_image_history"]) == 2
         assert updated["charges"]["kie_credits"] == "8.1"
+    finally:
+        server.shutdown(); server.server_close(); thread.join(timeout=2)
+
+
+def test_automatic_mask_flows_into_existing_masked_provider_request(tmp_path, monkeypatch):
+    class FakeKie:
+        def __init__(self): self.calls = []
+        def upload(self, path): self.calls.append(("upload", Path(path).name)); return f"https://fake.test/{Path(path).name}"
+        def create_masked_image_edit(self, prompt, inputs, mask, aspect_ratio="9:16"):
+            self.calls.append(("edit", prompt, list(inputs), mask, aspect_ratio)); return "task-auto"
+        def wait_for_task(self, task_id, on_state=None):
+            return {"state": "success", "creditsConsumed": "8.1", "resultJson": '{"resultUrls":["https://fake.test/output.png"]}'}
+        def download_result(self, task_data, destination): destination.write_bytes(_png_header(8, 12)); return destination
+        def close(self): pass
+
+    generated = []
+    def fake_mask(source, instructions, destination):
+        generated.append((source, instructions, destination))
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        destination.write_bytes(_png_header(8, 12))
+        return {"target": "coffee cup", "confidence": 0.91, "coverage": 0.08, "protected_overlap": 0.0}
+
+    monkeypatch.setattr("ecom_video.web_app.generate_automatic_mask", fake_mask)
+    client = FakeKie()
+    service = service_factory(tmp_path, client_factory=lambda: client)
+    service._spawn = lambda target, *args: target(*args)
+    ready = create_ready_job(service, tmp_path)
+    raw = service._read(ready["id"])
+    plan = __import__("ecom_video.workflow", fromlist=["MultiClipPlan"]).MultiClipPlan.model_validate_json(raw["plan_json"])
+    job_root = service._job_path(ready["id"]).parent
+    images = []
+    for index in range(1, len(plan.clips) + 1):
+        image = job_root / f"automatic-scene-{index}.png"
+        image.write_bytes(_png_header(8, 12)); images.append(image)
+    plan = plan.model_copy(update={"clips": [clip.model_copy(update={
+        "character_groups": ["mother", "baby"],
+        "environment_references": [str(images[index])] if index == 2 else [],
+    }) for index, clip in enumerate(plan.clips)]})
+    service._update(ready["id"], lambda data: data.update(
+        status="awaiting_image_review", stage="awaiting_image_review", estimate_reliable=True,
+        plan_json=plan.model_dump_json(),
+    ))
+    service._save_starting_image_assets(ready["id"], plan, images)
+
+    server = create_server(0, service)
+    thread = Thread(target=server.serve_forever, daemon=True); thread.start()
+    try:
+        boundary = "auto-mask-boundary"
+        body = (
+            f"--{boundary}\r\nContent-Disposition: form-data; name=\"edit_mode\"\r\n\r\nmasked\r\n"
+            f"--{boundary}\r\nContent-Disposition: form-data; name=\"base_source\"\r\n\r\nenvironment:3:0\r\n"
+            f"--{boundary}\r\nContent-Disposition: form-data; name=\"instructions\"\r\n\r\nRemove the coffee cup.\r\n"
+            f"--{boundary}--\r\n"
+        )
+        conn = HTTPConnection("127.0.0.1", server.server_port, timeout=5)
+        conn.request("POST", f"/api/jobs/{ready['id']}/clips/3/starting-image/regenerate", body,
+                     {"Content-Type": f"multipart/form-data; boundary={boundary}"})
+        response = conn.getresponse(); payload = json.loads(response.read()); conn.close()
+        assert response.status == 202 and payload["status"] == "awaiting_image_review"
+    finally:
+        server.shutdown(); server.server_close(); thread.join(timeout=2)
+
+    assert generated and generated[0][1] == "Remove the coffee cup."
+    edit = next(call for call in client.calls if call[0] == "edit")
+    assert edit[3].endswith("scene-inpaint-mask.png")
+    manifest_path = generated[0][2].parent / "generation-usage.json"
+    manifest = __import__("json").loads(manifest_path.read_text())
+    assert manifest["tasks"][0]["request"]["mask"]["generation"]["target"] == "coffee cup"
+    assert manifest["tasks"][0]["request"]["mask"]["generation"]["source_sha256"]
+
+
+def test_static_app_assets_disable_browser_cache_and_serve_current_file(tmp_path):
+    from ecom_video.web_app import WEB_ROOT
+
+    server = create_server(0, service_factory(tmp_path))
+    thread = Thread(target=server.serve_forever, daemon=True); thread.start()
+    try:
+        conn = HTTPConnection("127.0.0.1", server.server_port, timeout=3)
+        conn.request("GET", "/static/app.js")
+        response = conn.getresponse(); body = response.read(); headers = response.headers; conn.close()
+        assert response.status == 200
+        assert headers.get("Cache-Control") == "no-store"
+        assert body == (WEB_ROOT / "app.js").read_bytes()
     finally:
         server.shutdown(); server.server_close(); thread.join(timeout=2)
 
@@ -1549,6 +1807,43 @@ def test_resume_preserves_existing_clip_version_without_adding_a_duplicate(tmp_p
     assert all(len(clip["versions"]) == 1 for clip in final["clips"])
 
 
+def test_resume_preflights_current_prompts_before_clearing_persisted_failure(tmp_path, monkeypatch):
+    from ecom_video.workflow import compile_video_prompt as compile_prompt
+
+    service = service_factory(tmp_path)
+    ready = create_ready_job(service, tmp_path)
+    stale_error = "Clip 1 cannot be safely compacted: required details need 4040 prompt characters."
+    service._update(ready["id"], lambda job: job.update(
+        status="failed", stage="failed", error=stale_error, message=stale_error,
+        images_approved_at="2026-11-22T18:51:05+00:00",
+    ))
+
+    def invalid_prompt(*args, **kwargs):
+        raise ValueError("current prompt still exceeds the safe budget")
+
+    monkeypatch.setattr("ecom_video.web_app.compile_video_prompt", invalid_prompt)
+    service._spawn = lambda target, *args: None
+    with pytest.raises(ValueError, match="current prompt still exceeds"):
+        service.start_generation(ready["id"], approved_max_usd=Decimal("5.00"), resume=True)
+    assert service._read(ready["id"])["error"] == stale_error
+
+    compiled_lengths = []
+    def record_prompt(plan, clip, product_reference_count=0):
+        prompt = compile_prompt(plan, clip, product_reference_count)
+        compiled_lengths.append(len(prompt))
+        return prompt
+
+    monkeypatch.setattr("ecom_video.web_app.compile_video_prompt", record_prompt)
+    resumed = service.start_generation(ready["id"], approved_max_usd=Decimal("5.00"), resume=True)
+
+    assert resumed["status"] == "generating_clips"
+    assert resumed["can_resume"] is False
+    assert resumed["error"] is None
+    assert "Resuming from saved tasks and outputs." == resumed["message"]
+    assert len(compiled_lengths) == len(resumed["clips"]) == 3
+    assert all(length <= 3800 for length in compiled_lengths)
+
+
 def test_starting_image_review_regenerates_only_selected_image_and_uses_it_for_video(tmp_path, monkeypatch):
     calls = []
     service = service_factory(tmp_path, client_factory=lambda: type("Client", (), {"close": lambda self: None})())
@@ -1668,8 +1963,9 @@ def test_in_store_opening_regeneration_uses_scene_identity_without_prior_pose_re
     assert observed["character_references"] == [store_reference]
     assert len(observed["products"]) == 1  # the hidden product reference is filtered before image submission
     assert "warehouse aisle" in observed["prompt"].lower()
-    assert "understated, natural anticipation" in observed["prompt"]
-    assert "unretouched skin texture" in observed["prompt"]
+    assert "Both look ahead with surprised expressions" in observed["prompt"]
+    assert "The coffee's upright held state" not in observed["prompt"]
+    assert "natural unretouched skin" in observed["prompt"]
     assert "previous Clip 1 defines" not in observed["prompt"]
     assert "product photo defines" not in observed["prompt"]
 
@@ -1887,7 +2183,7 @@ def test_interrupted_starting_image_regeneration_resumes_saved_provider_task(tmp
     assert len(resumed["clips"][0]["starting_image_history"]) == 2
 
 
-def test_clip_video_regeneration_waits_for_image_approval(tmp_path, monkeypatch):
+def test_clip_video_regeneration_reuses_completed_image_without_global_approval_timestamp(tmp_path, monkeypatch):
     calls = []
     service = service_factory(tmp_path, client_factory=lambda: type("Client", (), {"close": lambda self: None})())
     service._spawn = lambda target, *args: target(*args)
@@ -1919,26 +2215,77 @@ def test_clip_video_regeneration_waits_for_image_approval(tmp_path, monkeypatch)
 
     monkeypatch.setattr("ecom_video.web_app.run_multiclip_generation", fake_generate)
     response = service.start_regeneration(ready["id"], 2, "show the tool contacting the sofa")
-    assert response["status"] == "awaiting_image_review"
-    assert calls == [("image", 2)]
-    review = service.get_job(ready["id"])
-    assert review["clip_regeneration_pending"] is True
-    assert all(clip["current_starting_image"] for clip in review["clips"])
-    service.approve_starting_images(ready["id"])
+    assert response["status"] == "completed"
+    assert calls == [("video", b"old-2")]
     final = service.get_job(ready["id"])
-    assert final["status"] == "completed"
-    assert calls[-1] == ("video", b"revised-image")
+    assert final["clips"][1]["current_starting_image"]["url"] == final["clips"][1]["versions"][0]["starting_image"]["url"]
     assert len(final["clips"][1]["versions"]) == 2
-    assert final["clips"][1]["versions"][0]["starting_image"]["url"] != final["clips"][1]["versions"][1]["starting_image"]["url"]
+    assert final["clips"][1]["versions"][0]["starting_image"]["url"] == final["clips"][1]["versions"][1]["starting_image"]["url"]
 
 
-def test_native_audio_clip_regeneration_reuses_approved_image_and_only_updates_selected_clip(tmp_path, monkeypatch):
-    from ecom_video.workflow import MultiClipPlan
+def test_reveal_motion_regeneration_reuses_approved_starting_image(tmp_path, monkeypatch):
+    from ecom_video.workflow import MultiClipPlan, compile_video_prompt
 
-    calls = []
     service = service_factory(tmp_path, client_factory=lambda: type("Client", (), {"close": lambda self: None})())
     service._spawn = lambda target, *args: target(*args)
     ready = create_ready_job(service, tmp_path)
+    plan = MultiClipPlan.model_validate_json(service._read(ready["id"])["plan_json"])
+    reveal_clip = plan.clips[0].model_copy(update={
+        "starting_state": "A blue cloth fully conceals the product on the table.",
+        "action": "Lift the cloth from its edge until the product is fully revealed.",
+        "ending_state": "The product is fully visible on the table.",
+        "source_observation": "One continuous physical cloth reveal.",
+    })
+    plan = plan.model_copy(update={"hook": "countdown_reveal", "clips": [reveal_clip, *plan.clips[1:]]})
+    service._update(ready["id"], lambda job: job.update(hook="countdown_reveal", plan_json=plan.model_dump_json()))
+    image = tmp_path / "approved-reveal.png"; image.write_bytes(b"approved-reveal-image")
+    video = tmp_path / "old-reveal.mp4"; video.write_bytes(b"old-reveal-video")
+    service._save_clip_version(ready["id"], reveal_clip, image, video, Decimal("0.14"), "original")
+    approved_image_id = service._read(ready["id"])["clips"][0]["current_starting_image_asset"]
+    service._update(ready["id"], lambda job: job.update(status="completed", stage="completed"))
+    observed = {}
+
+    def fake_generate(single_plan, products, continuity, output_dir, client, **kwargs):
+        clip = single_plan.clips[0]
+        observed.update(
+            image=kwargs["starting_images"][clip.index].read_bytes(),
+            images_only=kwargs.get("images_only", False),
+            prompt=compile_video_prompt(single_plan, clip),
+        )
+        output_dir.mkdir(parents=True, exist_ok=True)
+        result = output_dir / "clip-01-reveal-revision.mp4"; result.write_bytes(b"revised-video")
+        (output_dir / "generation-usage.json").write_text(json.dumps({
+            "expected_generation_tasks": 1, "all_task_charges_reported": True,
+            "tasks": [{"clip_index": 1, "kind": "video", "task_id": "reveal-video", "credits_consumed": "22.5", "status": "success"}],
+        }))
+        return [result]
+
+    monkeypatch.setattr("ecom_video.web_app.run_multiclip_generation", fake_generate)
+    result = service.start_regeneration(ready["id"], 1, "Motion-only correction: add a one-beat pause before lifting.")
+
+    assert result["status"] == "completed"
+    assert observed["image"] == b"approved-reveal-image"
+    assert observed["images_only"] is False
+    assert "preserve the observed reveal mechanism" in observed["prompt"].lower()
+    assert "one-beat pause" in observed["prompt"]
+    final = service._read(ready["id"])
+    assert final["clips"][0]["current_starting_image_asset"] == approved_image_id
+
+
+def test_native_audio_clip_regeneration_reuses_approved_image_and_only_updates_selected_clip(tmp_path, monkeypatch):
+    from ecom_video.workflow import MultiClipPlan, compile_video_prompt
+
+    calls = []
+    service = service_factory(tmp_path, client_factory=lambda: type("Client", (), {"close": lambda self: None})())
+    spawn_state = []
+    ready = create_ready_job(service, tmp_path)
+
+    def inline_spawn(target, *args):
+        running = service._read(ready["id"])
+        spawn_state.append((running["active_stage"], running["images_approved_at"], running["error"]))
+        target(*args)
+
+    service._spawn = inline_spawn
     plan = MultiClipPlan.model_validate_json(service._read(ready["id"])["plan_json"])
     plan.clips[0].audio_mode = "enabled"
     plan.clips[0].audio_direction = "Natural reaction and splash only; no music."
@@ -1949,12 +2296,16 @@ def test_native_audio_clip_regeneration_reuses_approved_image_and_only_updates_s
     saved = service._read(ready["id"])
     approved_image_id = saved["clips"][0]["current_starting_image_asset"]
     service._update(ready["id"], lambda job: job.update(
-        status="completed", stage="completed", images_approved_at="2026-11-19T12:00:00Z",
+        status="failed", stage="failed", error="stale 4251-character compaction error", images_approved_at=None,
     ))
 
     def fake_generate(single_plan, products, continuity, output_dir, client, **kwargs):
-        calls.append((kwargs.get("images_only", False), single_plan.clips[0].index,
-                      kwargs["starting_images"][1].read_bytes(), single_plan.clips[0].audio_enabled))
+        revised_clip = single_plan.clips[0]
+        prompt = compile_video_prompt(single_plan, revised_clip)
+        calls.append((kwargs.get("images_only", False), revised_clip.index,
+                      kwargs["starting_images"][1].read_bytes(), revised_clip.audio_enabled,
+                      revised_clip.starting_image_prompt == plan.clips[0].starting_image_prompt,
+                      len(prompt), prompt))
         output_dir.mkdir(parents=True, exist_ok=True)
         result = output_dir / "clip-01-revised.mp4"; result.write_bytes(b"audio-video")
         (output_dir / "generation-usage.json").write_text(json.dumps({
@@ -1965,16 +2316,107 @@ def test_native_audio_clip_regeneration_reuses_approved_image_and_only_updates_s
         return [result]
 
     monkeypatch.setattr("ecom_video.web_app.run_multiclip_generation", fake_generate)
-    result = service.start_regeneration(ready["id"], 1, "Drop the iced coffee and reveal the display.", Decimal("1.00"))
+    revision = (
+        "At approximately 1 second, release the ENTIRE iced coffee cup. The cup, lid, straw, and liquid visibly fall together under gravity, fully separating from her hand. "
+        "Do not pour liquid while she holds the cup. Keep the baby securely supported, the mother shocked, and reveal the brown Target hoodies with a rightward pan. "
+        "Synchronize realistic cup impact and spill audio to floor contact."
+    )
+    result = service.start_regeneration(ready["id"], 1, revision, Decimal("1.00"))
 
     assert result["status"] == "completed"
-    assert calls == [(False, 1, b"approved-image", True)]
+    assert spawn_state == [("generating_clips", None, None)]
+    assert len(calls) == 1
+    images_only, clip_index, image_bytes, audio_enabled, source_prompt_unchanged, prompt_length, prompt = calls[0]
+    assert (images_only, clip_index, image_bytes, audio_enabled, source_prompt_unchanged) == (
+        False, 1, b"approved-image", True, True,
+    )
+    assert prompt_length <= 3800
+    assert "entire iced coffee cup" in prompt.lower()
+    assert "fall together under gravity" in prompt.lower()
+    assert "do not pour liquid while she holds the cup" in prompt.lower()
+    assert "cup impact" in prompt.lower() and "spill" in prompt.lower()
+    assert "target hoodies" in prompt.lower()
     final = service._read(ready["id"])
     assert final["clips"][0]["current_starting_image_asset"] == approved_image_id
     assert len(final["clips"][0]["versions"]) == 2
     assert all(not clip["versions"] for clip in final["clips"][1:])
     latest_video_id = final["clips"][0]["versions"][-1]["video_asset"]
     assert final["assets"][latest_video_id]["role"] == "video_with_native_audio"
+
+
+def test_resume_failed_clip_revision_uses_saved_revision_and_only_selected_approved_image(tmp_path, monkeypatch):
+    from ecom_video.workflow import MultiClipPlan, compile_video_prompt
+
+    calls = []
+    service = service_factory(tmp_path, client_factory=lambda: type("Client", (), {"close": lambda self: None})())
+    service._spawn = lambda target, *args: target(*args)
+    ready = create_ready_job(service, tmp_path)
+    plan = MultiClipPlan.model_validate_json(service._read(ready["id"])["plan_json"])
+    clip = plan.clips[1].model_copy(update={
+        "visual_description": "Outdoors, the same mother lowers the baby into the integrated hoodie pouch.",
+        "starting_state": "The mother supports the baby above the open pouch.",
+        "action": "Visibly lower the baby into the pouch while continuously supporting the body.",
+        "ending_state": "The baby is seated inside the pouch, not against its exterior.",
+        "audio_mode": "enabled",
+        "audio_requested": True,
+        "audio_direction": "Fabric rustle synchronized to the insertion; no dialogue.",
+    })
+    plan = plan.model_copy(update={"clips": [plan.clips[0], clip, *plan.clips[2:]]})
+    service._update(ready["id"], lambda job: job.update(plan_json=plan.model_dump_json()))
+    image = tmp_path / "approved-clip-2.png"; image.write_bytes(b"approved-clip-2")
+    video = tmp_path / "old-clip-2.mp4"; video.write_bytes(b"old-clip-2")
+    service._save_clip_version(ready["id"], clip, image, video, Decimal("0.14"), "original")
+    approved_image_id = service._read(ready["id"])["clips"][1]["current_starting_image_asset"]
+    revision = (
+        "Show the complete downward insertion. Keep continuous support and the outdoor environment. "
+        "The baby must finish visibly seated INSIDE the integrated hoodie pouch, not against the exterior. "
+        "Do not skip insertion or invent a carrier mechanism. Sync fabric rustle to the lowering."
+    )
+    output_dir = tmp_path / "clip-02" / "version-2"
+    service._update(ready["id"], lambda job: job.update(
+        status="failed", stage="failed", error="stale 3824-character error",
+        images_approved_at=None, review_images_before_video=True,
+        pending_clip_regeneration={
+            "clip_index": 2, "instructions": revision, "output_dir": str(output_dir),
+            "version": 2, "image_ready": True, "reuse_approved_starting_image": True,
+            "approved_max_usd": None,
+        },
+    ))
+
+    def fake_generate(single_plan, products, continuity, target_dir, client, **kwargs):
+        revised = single_plan.clips[0]
+        prompt = compile_video_prompt(single_plan, revised)
+        calls.append({
+            "clip_indices": [item.index for item in single_plan.clips],
+            "image": kwargs["starting_images"][2].read_bytes(),
+            "images_only": kwargs.get("images_only", False),
+            "prompt": prompt,
+        })
+        target_dir.mkdir(parents=True, exist_ok=True)
+        output = target_dir / "clip-02-v2.mp4"; output.write_bytes(b"new-clip-2")
+        (target_dir / "generation-usage.json").write_text(json.dumps({
+            "expected_generation_tasks": 1, "all_task_charges_reported": True,
+            "tasks": [{"clip_index": 2, "kind": "video", "task_id": "clip-2-retry", "credits_consumed": "22.5", "status": "success"}],
+        }))
+        return [output]
+
+    monkeypatch.setattr("ecom_video.web_app.run_multiclip_generation", fake_generate)
+    result = service.start_generation(ready["id"], resume=True)
+
+    assert result["status"] == "completed"
+    assert len(calls) == 1
+    assert calls[0]["clip_indices"] == [2]
+    assert calls[0]["image"] == b"approved-clip-2"
+    assert calls[0]["images_only"] is False
+    assert len(calls[0]["prompt"]) <= 3800
+    assert "seated inside the integrated hoodie pouch" in calls[0]["prompt"].lower()
+    assert "sync fabric rustle" in calls[0]["prompt"].lower()
+    assert "outdoor environment" in calls[0]["prompt"].lower()
+    final = service._read(ready["id"])
+    assert final["error"] is None
+    assert final["clips"][1]["current_starting_image_asset"] == approved_image_id
+    assert len(final["clips"][1]["versions"]) == 2
+    assert not final["clips"][0]["versions"] and not final["clips"][2]["versions"]
 
 
 def test_per_clip_audio_mode_is_editable_visible_and_survives_restart(tmp_path):

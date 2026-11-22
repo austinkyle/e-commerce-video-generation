@@ -53,7 +53,7 @@
             <form id="creationForm" novalidate>
               <section class="panel plan-input-panel">
                 <label>Creation mode <select id="creationMode"><option value="reference">Reference Recreation</option><option value="original">Original Concept</option></select></label>
-                <label id="hookField">Creative format <select id="hookType"><option value="recommend">Automatic — let the Creative Director choose</option><option value="in_store_reaction" title="Immediate shopper reaction, quick product reveal, then product-specific story scenes">In-Store Reaction</option><option value="countdown_reveal">3-2-1 Reveal</option><option value="gifting">Gifting</option><option value="versus">Versus</option><option value="custom">Custom</option></select></label>
+                <label id="hookField">Creative format <select id="hookType"><option value="recommend">Automatic — let the Creative Director choose</option><option value="in_store_reaction" title="Immediate shopper reaction, quick product reveal, then product-specific story scenes">In-Store Reaction</option><option value="countdown_reveal" title="Build anticipation, reveal through the source's actual mechanism, then show product proof and payoff; no literal countdown required">3-2-1 Reveal</option><option value="gifting">Gifting</option><option value="versus">Versus</option><option value="custom">Custom</option></select></label>
               </section>
               <section class="panel input-panel" aria-labelledby="referenceHeading">
                 <div class="section-heading">
@@ -93,8 +93,13 @@
                   <div><h2 id="directionHeading">Creative direction</h2><p>Describe the changes naturally. The reference provides the visual rhythm.</p></div>
                 </div>
                 <label class="visually-hidden" for="instructions">Creative instructions</label>
-                <textarea id="instructions" name="instructions" rows="5" maxlength="20000" placeholder="Use this video's creative structure, but feature my product. Change the model and setting while keeping the demonstration realistic…"></textarea>
-                <div class="field-foot"><span>Product details in supplied photos are treated as the visual source of truth.</span><span id="characterCount">0 / 20,000</span></div>
+                <textarea id="instructions" name="instructions" rows="5" maxlength="40000" placeholder="Use this video's creative structure, but feature my product. Change the model and setting while keeping the demonstration realistic…"></textarea>
+                <div class="field-foot"><span>Product details in supplied photos are treated as the visual source of truth.</span><span id="characterCount">0 / 40,000</span></div>
+                <p id="creativeDirectionError" class="creative-direction-error" role="alert" hidden></p>
+                <div id="creativeDirectionEditor" class="creative-direction-editor" hidden>
+                  <p id="creativeDirectionRevisionNote" class="field-foot" hidden></p>
+                  <div class="creative-direction-actions"><p id="creativeDirectionStatus" class="field-foot" aria-live="polite">Edit the full direction; saving updates the Creative Plan without regenerating media.</p><div><button id="editCreativeDirectionButton" class="button button-secondary" type="button">Edit Creative Direction</button><button id="saveCreativeDirectionButton" class="button button-secondary" type="button" hidden>Save and update plan</button><button id="cancelCreativeDirectionButton" class="button button-secondary" type="button" hidden>Cancel</button></div></div>
+                </div>
               </section>
 
               <section class="panel plan-input-panel" aria-labelledby="formatHeading">
@@ -113,7 +118,7 @@
 
             <section id="interviewSection" class="panel analysis-panel" hidden>
               <h2>The Creative Director has a few questions</h2><div id="directorQuestions" class="analysis-notes"></div>
-              <form id="answerForm"><label for="interviewAnswer">Your answer</label><textarea id="interviewAnswer" rows="3" required maxlength="20000"></textarea><button class="button button-primary" type="submit">Send answer</button></form>
+              <form id="answerForm"><label for="interviewAnswer">Your answer</label><textarea id="interviewAnswer" rows="3" required maxlength="40000"></textarea><button class="button button-primary" type="submit">Send answer</button></form>
             </section>
 
             <section id="analysisSection" class="panel analysis-panel" hidden aria-labelledby="analysisHeading">
@@ -126,7 +131,7 @@
               <div id="plannedShots" class="planned-shots"></div>
               <form id="refinePlanForm" class="plan-refinement" hidden>
                 <label for="refinePlanInput">Refine Creative Plan</label>
-                <textarea id="refinePlanInput" rows="3" maxlength="20000" placeholder="Change the hook, adjust a specific shot, or refine the payoff…"></textarea>
+                <textarea id="refinePlanInput" rows="3" maxlength="40000" placeholder="Change the hook, adjust a specific shot, or refine the payoff…"></textarea>
                 <button id="updatePlanButton" class="button button-secondary" type="submit">Update Plan</button>
                 <p class="field-foot">The existing concept, confirmed product facts, and other shots are preserved.</p>
               </form>

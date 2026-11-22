@@ -12,24 +12,25 @@ from pydantic import BaseModel, Field, model_validator
 
 from ecom_video.costs import IMAGE_1K_USD, KIE_USD_PER_CREDIT, GenerationEstimate, estimate_generation, estimate_within_approved_amount
 from ecom_video.creative_playbook import (
+    COUNTDOWN_REVEAL_IMAGE_RULES,
+    COUNTDOWN_REVEAL_VIDEO_RULES,
+    GIFTING_UNBOXING_IMAGE_RULES,
+    GIFTING_UNBOXING_REFERENCE_RULES,
+    GIFTING_UNBOXING_VIDEO_RULES,
     IN_STORE_REACTION_IMAGE_RULES,
     IN_STORE_REACTION_VIDEO_RULES,
+    REFERENCE_RECREATION_PROMPT_RULES,
 )
 from ecom_video.media import make_mp4, make_silent_mp4, probe_video
 from ecom_video.models import AnalysisResult, AudioMode, ShotPlan
 from ecom_video.prompt_limits import KIE_VIDEO_PROMPT_SAFE_CHARACTERS, kie_video_prompt_length
 
 AUTO_GENERATION_APPROVAL_LIMIT_USD = Decimal("0.50")
-MAX_CREATIVE_INSTRUCTIONS = 20_000
-IN_STORE_OPENING_IMAGE_RULES = (
-    "Opening reaction image: show understated, spontaneous anticipation with relaxed facial features. "
-    "Use the matching-scene reference to preserve identity, clothing, and setting only; do not copy its expression or pose."
-)
-
-
+MAX_CREATIVE_INSTRUCTIONS = 40_000
 def creative_instruction_length(instructions: str) -> int:
     """Match the browser textarea's UTF-16 character-counting behavior."""
-    return len(instructions.encode("utf-16-le")) // 2
+    normalized = instructions.replace("\r\n", "\n").replace("\r", "\n")
+    return len(normalized.encode("utf-16-le")) // 2
 
 
 class PlannedClip(BaseModel):
@@ -49,6 +50,8 @@ class PlannedClip(BaseModel):
     continuity_group: str = ""
     character_groups: list[str] = Field(default_factory=list)
     continuity_notes: list[str] = Field(default_factory=list)
+    source_observation: str = ""
+    applied_user_changes: list[str] = Field(default_factory=list)
     duration_seconds: int = Field(ge=1, le=15)
     edit_duration_seconds: float | None = Field(default=None, ge=0.5, le=15)
     audio_mode: AudioMode = "auto"
@@ -111,25 +114,30 @@ def _product_is_off_frame_at_start(clip: "PlannedClip") -> bool:
 
 
 def starting_image_revision_prompt(plan: "MultiClipPlan", clip: "PlannedClip", instructions: str = "") -> str:
-    """Refresh saved In-Store image guidance without changing the saved creative plan."""
+    """Refresh saved format-specific image guidance without changing the creative plan."""
     prompt = clip.starting_image_prompt
     in_store = plan.hook in {"in_store_reaction", "wet_works"}
+    countdown_reveal = plan.hook == "countdown_reveal"
+    gifting = plan.hook == "gifting"
     if in_store:
         if clip.index == 1:
             prompt = re.sub(
-                r"\bboth look ahead with surprised expressions\b",
-                "both look ahead with understated, natural anticipation",
-                prompt,
-                flags=re.IGNORECASE,
-            )
-            prompt = re.sub(
                 r"Reference roles:.*?(?=\sShow only (?:this )?(?:initial state|details visible at the start of the video)\.|$)",
-                "Reference roles: use the approved same-scene image for character identity, clothing, and warehouse environment only; do not copy its expression or pose. The coffee's upright held state follows the saved frame-zero direction. ",
+                "",
                 prompt,
                 flags=re.IGNORECASE | re.DOTALL,
             )
-            prompt += f" {IN_STORE_OPENING_IMAGE_RULES}"
+        if clip.source_start_seconds is not None and clip.source_end_seconds is not None and REFERENCE_RECREATION_PROMPT_RULES not in prompt:
+            prompt += f" {REFERENCE_RECREATION_PROMPT_RULES}"
         prompt += f" {IN_STORE_REACTION_IMAGE_RULES}"
+    if countdown_reveal:
+        if clip.source_start_seconds is not None and clip.source_end_seconds is not None and REFERENCE_RECREATION_PROMPT_RULES not in prompt:
+            prompt += f" {REFERENCE_RECREATION_PROMPT_RULES}"
+        prompt += f" {COUNTDOWN_REVEAL_IMAGE_RULES}"
+    if gifting:
+        if clip.source_start_seconds is not None and clip.source_end_seconds is not None and REFERENCE_RECREATION_PROMPT_RULES not in prompt:
+            prompt += f" {REFERENCE_RECREATION_PROMPT_RULES}"
+        prompt += f" {GIFTING_UNBOXING_IMAGE_RULES}"
     if instructions.strip():
         prompt += f"\nRequested revision: {instructions.strip()}"
     return prompt
@@ -174,6 +182,149 @@ def _provider_text(value: str) -> str:
     return " ".join(value.split())
 
 
+_REVISION_STOP_WORDS = {
+    "a", "an", "and", "are", "as", "at", "be", "by", "for", "from", "her", "his",
+    "in", "into", "is", "it", "its", "of", "on", "or", "the", "their", "then", "to",
+    "with", "while", "this", "that", "she", "he", "they", "only",
+}
+
+
+def _compact_clip_revision(revision: str, existing_prompt: str) -> str:
+    """Remove repeated scene directions and shorten repeated motion/audio clauses.
+
+    Keep novel action details intact. This is deterministic and never truncates
+    user instructions; if unique requirements still exceed the provider budget,
+    the normal explicit over-budget error remains in force.
+    """
+    clauses = [
+        _provider_text(clause)
+        for clause in re.split(r"(?<=[.!?])\s+|\n+", revision)
+        if clause.strip()
+    ]
+    existing_terms = {
+        term for term in re.findall(r"[a-z0-9]+", existing_prompt.lower())
+        if len(term) > 2 and term not in _REVISION_STOP_WORDS
+    }
+    unique_clauses: list[str] = []
+    for clause in clauses:
+        if re.fullmatch(r"No extra gestures, cuts, dialogue, or changes to other clips\.?", clause, re.I):
+            # Clip-only regeneration cannot alter other clips; the compiled base
+            # prompt separately enforces cuts and dialogue constraints.
+            unique_clauses.append("No extra gestures.")
+            continue
+        terms = [
+            term for term in re.findall(r"[a-z0-9]+", clause.lower())
+            if len(term) > 2 and term not in _REVISION_STOP_WORDS
+        ]
+        has_negation = bool(re.search(r"\b(?:no|not|never|without|don't|doesn't|isn't|can't)\b", clause, re.I))
+        overlap = sum(term in existing_terms for term in terms) / len(terms) if terms else 0
+        if len(terms) >= 8 and overlap >= 0.86 and not has_negation:
+            continue
+        if "baby" in terms and any(term in terms for term in ("support", "supports", "supported")) and overlap >= 0.65:
+            unique_clauses.append("Keep the baby securely supported throughout.")
+            continue
+        has_new_physical_beat = bool(re.search(
+            r"\b(?:cup|coffee|pour|release|released|drop|dropped|fall|falling|gravity|impact|spill|splash|audio|sound|slow|slower|faster|pause|hold|accelerate|decelerate)\b",
+            clause, re.I,
+        ))
+        if len(terms) >= 8 and overlap >= 0.5 and not has_negation and not has_new_physical_beat:
+            continue
+        unique_clauses.append(clause)
+
+    # A prior-version warning and its corrective prohibition say the same
+    # thing. Keep the actionable physical constraint in one short clause.
+    if any(re.search(r"\bpour(?:s|ed|ing)?\b", clause, re.I) for clause in unique_clauses):
+        has_cup_in_hand_context = any(
+            re.search(r"\b(?:cup|coffee|drink)\b.{0,100}\b(?:hand|held|holding)\b", clause, re.I)
+            for clause in unique_clauses
+        )
+        if has_cup_in_hand_context:
+            unique_clauses = [
+                clause for clause in unique_clauses
+                if not re.search(r"\b(?:previous version|repeat that mistake)\b", clause, re.I)
+            ]
+            unique_clauses.append("Do not pour liquid while the cup is held.")
+
+    # When the base prompt already specifies synced cup-impact audio, retain any
+    # newly requested spill detail without restating the whole sound direction.
+    base_has_synced_cup_audio = (
+        "cup" in existing_terms and "impact" in existing_terms and "liquid" in existing_terms
+        and any(word in existing_terms for word in ("sync", "synced", "synchronize", "synchronized"))
+    )
+    if base_has_synced_cup_audio:
+        audio_clauses = [
+            clause for clause in unique_clauses
+            if re.search(r"\b(?:sound|audio|impact|spill|splash)\b", clause, re.I)
+            and re.search(r"\b(?:cup|coffee|liquid)\b", clause, re.I)
+        ]
+        if audio_clauses and any(re.search(r"\bspill|splash\b", clause, re.I) for clause in audio_clauses):
+            unique_clauses = [clause for clause in unique_clauses if clause not in audio_clauses]
+            unique_clauses.append("Sync realistic liquid-spill sound with cup impact.")
+        elif audio_clauses:
+            unique_clauses = [clause for clause in unique_clauses if clause not in audio_clauses]
+
+    compacted = " ".join(unique_clauses)
+    if len(compacted) > 70 and re.search(r"\b(?:coffee|cup)\b.{0,60}\b(?:drop|release|fall)\b", compacted, re.I):
+        compacted = re.sub(r"^Fix ONLY the coffee-drop action in Clip \d+\.\s*", "Motion-only revision. ", compacted, flags=re.I)
+    return compacted
+
+
+def _compact_final_video_prompt(prompt: str) -> str:
+    """Compact redundancy only after all provider-facing instructions are assembled."""
+    lines = prompt.splitlines()
+    # Plan revision instructions are workflow metadata, not visible scene
+    # requirements. Keep the explicit creative changes in the saved plan while
+    # omitting procedural directions from the provider-facing prompt.
+    for index, line in enumerate(lines):
+        if not line.startswith("Explicit changes authorized for this scene:"):
+            continue
+        label, _, value = line.partition(":")
+        changes = [change.strip() for change in value.split(";") if change.strip()]
+        changes = [
+            change for change in changes
+            if not re.search(
+                r"\b(?:reconcile|compare)\b.{0,100}\b(?:creative plan|creative direction|original_instructions)\b",
+                change,
+                re.I,
+            )
+            and not re.search(r"\bdo not regenerate media\b", change, re.I)
+        ]
+        lines[index] = f"{label}: {'; '.join(changes)}" if changes else ""
+
+    revision_index = next(
+        (index for index, line in enumerate(lines) if line.startswith("Clip-specific revision:")),
+        None,
+    )
+    if revision_index is not None:
+        revision = lines[revision_index].partition(":")[2].strip()
+        # Repeated clip-only edits can be stored as nested revision markers.
+        revision = re.sub(r"\s*Clip-specific revision:\s*", " ", revision)
+        base_prompt = "\n".join(line for index, line in enumerate(lines) if index != revision_index)
+        compact_revision = _compact_clip_revision(revision, base_prompt)
+        lines[revision_index] = f"Clip-specific revision: {compact_revision}" if compact_revision else ""
+
+    # Exact repeated sentences are safe to collapse: one complete copy remains
+    # in the final prompt, including any action, state, product, camera, or audio
+    # requirement expressed by that sentence.
+    seen_sentences: set[str] = set()
+    compact_lines: list[str] = []
+    for line in lines:
+        if not line.strip():
+            continue
+        kept: list[str] = []
+        for sentence in re.split(r"(?<=[.!?])\s+", line.strip()):
+            key = sentence.casefold().strip()
+            key = re.sub(r"\s+", " ", key)
+            if key and key in seen_sentences:
+                continue
+            if key:
+                seen_sentences.add(key)
+            kept.append(sentence)
+        if kept:
+            compact_lines.append(" ".join(kept))
+    return "\n".join(compact_lines)
+
+
 def compile_video_prompt(plan: MultiClipPlan, clip: PlannedClip, product_reference_count: int = 0) -> str:
     """Compact an oversized saved prompt from its structured shot direction.
 
@@ -182,52 +333,79 @@ def compile_video_prompt(plan: MultiClipPlan, clip: PlannedClip, product_referen
     """
     notes = list(dict.fromkeys(_provider_text(note) for note in clip.continuity_notes if note.strip()))
     in_store = plan.hook in {"in_store_reaction", "wet_works"}
+    countdown_reveal = plan.hook == "countdown_reveal"
+    gifting = plan.hook == "gifting"
+    product_anchored_format = in_store or countdown_reveal or gifting
+    reference_recreation = (in_store or countdown_reveal or gifting) and clip.source_start_seconds is not None and clip.source_end_seconds is not None
     if not 0 <= product_reference_count <= 6:
         raise ValueError("Grok video prompts support at most six additional product references")
-    is_opening = in_store and clip.index == 1 and any(
-        word in clip.creative_role.lower() for word in ("reaction", "hook", "reveal", "discovery")
+    is_opening = in_store and clip.index == 1 and (
+        reference_recreation or any(
+            word in clip.creative_role.lower() for word in ("reaction", "hook", "reveal", "discovery")
+        )
     )
     ad_concept = plan.summary
     if is_opening:
-        ad_concept = (
-            "In-Store Reaction hook: preserve this scene's approved shopper, product, and retail setting; "
-            "build one continuous reaction-to-reveal shot."
-        )
+        ad_concept = "Reference recreation." if reference_recreation else "In-Store Reaction: faithfully recreate this opening source shot as described below."
     elif in_store:
-        ad_concept = (
-            "In-Store Reaction ad: the opening reaction/reveal is complete; this clip advances the product-specific story. "
-            "Follow this clip's scene and continuity notes for its cast and setting; do not carry the hook shopper into this clip unless explicitly named."
-        )
-    duration_line = f"Generated clip length: {clip.duration_seconds}s." if in_store else ""
-    if in_store and clip.edit_duration_seconds is not None:
+        # The clip's scene and continuity fields already define its cast and setting.
+        ad_concept = "In-Store Reaction: the hook is complete; continue this clip's distinct scene."
+    duration_line = f"Generated clip length: {clip.duration_seconds}s." if product_anchored_format else ""
+    if product_anchored_format and clip.edit_duration_seconds is not None:
         duration_line += f" Intended final edit use: {clip.edit_duration_seconds:g}s; the final edit may trim this generated clip."
     physical_instruction = (
         "Physical reliability: preserve the starting state and exact product mechanism; show the real contact, support, trigger, or force and its causal result. Keep movement physically plausible."
         if in_store else
+        "Physical reliability: preserve the observed reveal or edit mechanism, product geometry, credible support and contact, and the specified ending state."
+        if countdown_reveal else
+        "Physical reliability: preserve package structure and current state; show continuous grip, opening, removal, fitting, installation, and product interaction only as observed, with plausible support and the stated ending state."
+        if gifting else
         "Physical reliability: preserve the exact starting orientation; place the working surface toward the fabric with a visible contact point; show a natural grip and support. Use one primary physical movement where practical."
     )
     audio_enabled = clip.audio_enabled
     video_type = "smartphone video" if audio_enabled else "silent smartphone video"
     product_facts = _provider_text(plan.product_facts)
-    if in_store:
+    if product_anchored_format:
         # The video request receives image URLs, not source-video frames. Keep
         # provider-facing facts honest about the references actually attached.
-        product_facts = re.sub(
+        for boilerplate in (
+            r"\s*Match visible product appearance and construction in supplied product image references\.?",
             r"\s*When no product photos are supplied, use the reference video frames\.?",
-            "", product_facts, flags=re.I,
-        )
+            r"\s*Do not infer unseen capabilities\.?",
+        ):
+            product_facts = re.sub(boilerplate, "", product_facts, flags=re.I)
+        product_facts = product_facts.strip(" .;,")
     parts = [
         f"Create one continuous {clip.duration_seconds}-second vertical 9:16, 720p {video_type} from the supplied starting image.",
         *([duration_line] if duration_line else []),
         f"Ad concept: {_provider_text(ad_concept)}",
-        f"Product identity and fixed specifications: {product_facts}",
+        *([f"Product identity and fixed specifications: {product_facts}"] if product_facts else []),
         f"Creative purpose: {_provider_text(clip.creative_role)}",
         f"Scene: {_provider_text(clip.visual_description)}",
         f"Starting physical state: {_provider_text(clip.starting_state)}",
         f"Ordered physical action: {_provider_text(clip.action)}",
         f"Ending state and payoff: {_provider_text(clip.ending_state)}",
     ]
-    if in_store and product_reference_count:
+    if countdown_reveal:
+        parts.append(COUNTDOWN_REVEAL_VIDEO_RULES)
+        if not reference_recreation:
+            parts.append("3-2-1 Reveal is a creative format name; do not add a literal countdown unless the creator requests it.")
+    if gifting:
+        parts.append(GIFTING_UNBOXING_PLAYBOOK if not reference_recreation else GIFTING_UNBOXING_VIDEO_RULES)
+        if reference_recreation:
+            parts.append(GIFTING_UNBOXING_REFERENCE_RULES)
+    if re.search(r"\b(?:drop(?:s|ped)?|release(?:s|d)?|fall(?:s|en|ing)?)\b", clip.action, re.I) and not re.search(r"\bgravity\b", clip.action, re.I):
+        parts.append("Drop physics: show the released object falling under gravity to its stated impact or spill.")
+    if reference_recreation:
+        parts.append(
+            f"Reference segment {clip.source_start_seconds:.1f}-{clip.source_end_seconds:.1f}s is the production blueprint."
+        )
+        parts.append(REFERENCE_RECREATION_PROMPT_RULES.replace("Blueprint:", "Reference production blueprint:", 1))
+        if clip.source_observation:
+            parts.append(f"Observed original source scene: {_provider_text(clip.source_observation)}")
+        if clip.applied_user_changes:
+            parts.append("Explicit changes authorized for this scene: " + "; ".join(_provider_text(item) for item in clip.applied_user_changes))
+    if product_anchored_format and product_reference_count:
         product_labels = "@image2" if product_reference_count == 1 else f"@image2-@image{product_reference_count + 1}"
         parts.append(
             f"Refs: @image1=start/scene; {product_labels}=product only; ignore ref bg."
@@ -239,15 +417,24 @@ def compile_video_prompt(plan: MultiClipPlan, clip: PlannedClip, product_referen
         parts.append(f"Product interaction and mechanism: {product_interaction}")
     parts.append(f"Camera framing and movement: {_provider_text(clip.camera)}")
     if is_opening:
-        parts.append(
-            f"Hook direction: immediate, emotionally legible shopper reaction; one motivated gesture and quick product reveal; "
-            f"natural handheld smartphone movement, all within this continuous {clip.duration_seconds}-second clip."
+        hook_direction = (
+            "reproduce only the observed reaction and camera move in order; add no beats"
+            if reference_recreation else
+            "immediate, emotionally legible shopper reaction; one motivated gesture and quick product reveal"
         )
+        parts.append(f"Hook direction: {hook_direction}; fit it within this continuous {clip.duration_seconds}-second clip without embellishment.")
     elif in_store:
         parts.append("Cast continuity: preserve the person already visible in the supplied starting image; do not replace them with the opening shopper unless this clip explicitly calls for that same person.")
     if in_store:
         parts.append(IN_STORE_REACTION_VIDEO_RULES)
-    if in_store:
+        if reference_recreation:
+            parts.append("Preserve observed beats; preserve their order and timing; add no unobserved actions.")
+    elif reference_recreation:
+        # The shot action, source observation, and blueprint already encode the
+        # reference-specific sequence. Keep only the generic motion invariants
+        # needed by this clip instead of repeating the full playbook.
+        parts.append("Natural handheld motion; preserve identity and product geometry; show plausible support, gravity, and contact.")
+    if in_store and (is_opening or "payoff" in clip.creative_role.lower()):
         if clip.scene_payoff and _provider_text(clip.scene_payoff) != _provider_text(clip.ending_state):
             parts.append(f"Product-specific payoff: {_provider_text(clip.scene_payoff)}")
     if audio_enabled:
@@ -259,18 +446,23 @@ def compile_video_prompt(plan: MultiClipPlan, clip: PlannedClip, product_referen
         parts.append("Audio is disabled for this clip; produce no audio stream, dialogue, music, or sound effects.")
     if notes:
         parts.append("Visual continuity: " + "; ".join(notes))
-    if clip.source_start_seconds is not None and clip.source_end_seconds is not None:
-        parts.append(
-            f"Reference segment {clip.source_start_seconds:.1f}-{clip.source_end_seconds:.1f}s informs framing rhythm only; do not copy its subject, product, or setting."
+    if clip.source_start_seconds is not None and clip.source_end_seconds is not None and not reference_recreation:
+        source_relation = (
+            "informs framing rhythm only; do not copy its subject, product, or setting."
         )
+        parts.append(f"Reference segment {clip.source_start_seconds:.1f}-{clip.source_end_seconds:.1f}s {source_relation}")
     revision = re.search(r"(?:^|\n)Clip-specific revision:\s*(.+)", clip.video_prompt, flags=re.DOTALL)
     if revision:
         parts.append(f"Clip-specific revision: {_provider_text(revision.group(1))}")
-    if in_store:
+    if countdown_reveal and reference_recreation:
+        parts.append("Preserve each source-required edit cut exactly; no morphing, object teleportation, or impossible motion.")
+    elif in_store:
         parts.append("Keep identities and product geometry stable. No cuts, morphing, or impossible motion.")
+    elif countdown_reveal:
+        parts.append("Keep identity, packaging, proportions, and physical contact consistent. Use no unrequested cuts, morphing, or impossible motion.")
     else:
         parts.append("Keep identity, packaging, proportions, and physical contact consistent. Make the mechanism visible. Avoid complex transformations; if the action requires a difficult before-to-after change, depict the simple observable action and end state without inventing intermediate mechanics. No cuts, morphing, or impossible motion.")
-    compacted = "\n".join(parts)
+    compacted = _compact_final_video_prompt("\n".join(parts))
     length = kie_video_prompt_length(compacted)
     if length > KIE_VIDEO_PROMPT_SAFE_CHARACTERS:
         raise ValueError(
@@ -400,6 +592,9 @@ def _make_prompts(
     visual_description = shot.visual_description.strip().rstrip(".")
     image_continuity_anchors = "; ".join(dict.fromkeys(note.strip() for note in shot.continuity_notes if note.strip()))
     is_in_store = hook in {"in_store_reaction", "wet_works"}
+    is_countdown_reveal = hook == "countdown_reveal"
+    is_gifting = hook == "gifting"
+    is_reference_format = is_in_store or is_countdown_reveal or is_gifting
     target_duration = shot.target_duration_seconds or seconds_per_clip
     edit_duration = shot.edit_duration_seconds
     in_store_opening = is_in_store and index == 1 and any(
@@ -427,8 +622,8 @@ def _make_prompts(
     )
     if in_store_opening:
         scene_direction += (
-            f"\nOpening-hook unit: complete the shopper's immediate reaction, one motivated gesture, and a fast, "
-            f"clearly identifiable product reveal inside this single {target_duration}-second target clip. "
+            f"\nOpening-hook unit: preserve this source shot's observed reaction, gesture, reveal, and camera movement "
+            f"inside this single {target_duration}-second target clip; add none that are absent. "
             "Do not allocate a second clip to another reaction gesture. Source timestamps describe the reference segment, "
             "not seconds within this generated target clip."
         )
@@ -444,12 +639,16 @@ def _make_prompts(
         f"People and continuity: {image_continuity_anchors or creative_role}. "
         f"Product: {product_facts}. Frame zero: {starting_state}. "
         f"Framing: {shot.camera}. Show only details visible at the start of the video."
-        + (f" {IN_STORE_REACTION_IMAGE_RULES}" if is_in_store else "")
+        + (f" {REFERENCE_RECREATION_PROMPT_RULES} " if has_source_segment and is_reference_format else "")
+        + (f"Authorized changes for this scene: {'; '.join(shot.applied_user_changes)}. " if has_source_segment and shot.applied_user_changes else "")
+        + (f"{IN_STORE_REACTION_IMAGE_RULES}" if is_in_store else "")
+        + (f" {COUNTDOWN_REVEAL_IMAGE_RULES}" if is_countdown_reveal else "")
+        + (f" {GIFTING_UNBOXING_IMAGE_RULES}" if is_gifting else "")
     )
     duration_direction = (
         f"Target generated clip duration: {target_duration} seconds. Intended final edit use: {edit_duration if edit_duration is not None else target_duration} seconds. "
         "Final edit duration may be shorter than the generated clip. Source-video timestamps refer only to the original reference.\n"
-        if is_in_store else f"Target clip duration: {target_duration} seconds.\n"
+        if is_in_store or ((is_countdown_reveal or is_gifting) and has_source_segment) else f"Target clip duration: {target_duration} seconds.\n"
     )
     in_store_video_guidance = (
         "Show a clear progression from the defined starting state through the concrete physical action to the defined "
@@ -469,11 +668,17 @@ def _make_prompts(
         f"Shared creator requirements distilled from the complete brief: {scoped_requirements}\n"
         f"Scene-specific target direction: {scene_direction}\n"
         f"Continuity requirements: {continuity_requirements}\n"
-        "Use the analyzed source segment for framing rhythm only; do not copy its subject, product, "
-        "action, or location. Follow the target creative direction and references. "
+        + (
+            f"{REFERENCE_RECREATION_PROMPT_RULES} Follow only explicit creator changes; preserve every other observed detail. "
+            if is_reference_format and has_source_segment else
+            "Use the analyzed source segment for framing rhythm only; do not copy its subject, product, action, or location. "
+        )
+        + "Follow the target creative direction and references. "
         f"This is target shot {index}; follow the Shot {index} direction above. {video_camera_direction} "
         f"{in_store_video_guidance}"
-        "Prefer one primary physical movement per shot. If a difficult transformation cannot be shown believably in one clip, "
+        + (f"{COUNTDOWN_REVEAL_VIDEO_RULES} " if is_countdown_reveal else "")
+        + (f"{GIFTING_UNBOXING_VIDEO_RULES} " if is_gifting else "")
+        + "Prefer one primary physical movement per shot. If a difficult transformation cannot be shown believably in one clip, "
         "simplify the observable action or recommend separate before-and-after shots without losing the intended story. Keep physical contact and movement believable. Keep the product "
         "accurate and unchanged. Keep the product design accurate and consistent with its reference images. "
         "Do not invent unseen product structure or capabilities. No cuts, morphing, or duplicated limbs. "
@@ -626,7 +831,7 @@ def build_multiclip_plan(
     if not instructions.strip():
         raise ValueError("creative instructions are required")
     if creative_instruction_length(instructions) > MAX_CREATIVE_INSTRUCTIONS:
-        raise ValueError("creative instructions must be 20,000 characters or fewer")
+        raise ValueError("creative instructions must be 40,000 characters or fewer")
     if not product_facts.strip():
         raise ValueError("product facts are required")
     if not environment.strip():
@@ -673,6 +878,8 @@ def build_multiclip_plan(
             continuity_group=shot.continuity_group,
             character_groups=shot.character_groups,
             continuity_notes=shot.continuity_notes,
+            source_observation=shot.source_observation,
+            applied_user_changes=shot.applied_user_changes,
             duration_seconds=shot.target_duration_seconds or seconds_per_clip,
             edit_duration_seconds=shot.edit_duration_seconds,
             audio_mode="auto",
@@ -771,7 +978,7 @@ def _write_usage_manifest(output_dir: Path, tasks: list[dict], expected_task_cou
     (output_dir / "generation-usage.json").write_text(json.dumps(manifest, indent=2) + "\n")
 
 
-def find_saved_mask_for_scene(outputs_dir: Path, source_image: Path) -> Path | None:
+def find_saved_mask_for_scene(outputs_dir: Path, source_image: Path, target: str | None = None) -> Path | None:
     """Find a prior edit mask only when its recorded first/source image matches exactly."""
     source_image = source_image.expanduser().resolve()
     if not source_image.is_file():
@@ -788,6 +995,10 @@ def find_saved_mask_for_scene(outputs_dir: Path, source_image: Path) -> Path | N
             mask_info = request.get("mask") or {}
             if not references or references[0].get("sha256") != source_hash or not mask_info.get("filename"):
                 continue
+            if target is not None:
+                generation = mask_info.get("generation") or {}
+                if generation.get("target", "").casefold() != target.casefold():
+                    continue
             mask_path = (manifest_path.parent / Path(mask_info["filename"]).name).resolve()
             if not mask_path.is_file():
                 continue
@@ -798,13 +1009,19 @@ def find_saved_mask_for_scene(outputs_dir: Path, source_image: Path) -> Path | N
     return None
 
 
-def _masked_edit_prompt(clip: PlannedClip, scene_prompt: str) -> str:
+def _masked_edit_prompt(clip: PlannedClip, scene_prompt: str, instructions: str = "") -> str:
+    requested_change = (
+        f" User-requested masked change (apply only within the transparent editable mask): {instructions.strip()} "
+        "This requested change may update the specified details, such as clothing, while all unrequested scene, character, "
+        "and product details remain governed by the scene and reference directions."
+        if instructions.strip() else ""
+    )
     return (
         "Edit the first input image using its attached alpha mask. The first input is the selected scene base and environment only. "
         "Transparent mask pixels are editable; preserve the environment and every pixel outside that region. "
         "Use the following scene-specific starting-frame direction for the edited region, including its intended action, pose, "
         "expression, wardrobe, and lighting: "
-        f"{clip.visual_description} Frame zero: {clip.starting_state} {scene_prompt} "
+        f"{clip.visual_description} Frame zero: {clip.starting_state} {scene_prompt}.{requested_change} "
         "Every character reference is for identity only: preserve recognizable face, skin tone, hair, age, and body proportions; "
         "ignore that reference's pose, expression, wardrobe, and environment. "
         "Every product reference is for product appearance only, including construction; ignore its person, pose, lighting, and background. "
@@ -823,6 +1040,8 @@ def run_masked_image_edit(
     client: KieWorkflowClient,
     scene_prompt: str | None = None,
     resume: bool = False,
+    instructions: str = "",
+    mask_metadata: dict | None = None,
 ) -> Path:
     """Run one opt-in Sunburst 2.6 masked edit with scene, character, and product roles separated."""
     scene_base = scene_base.expanduser().resolve()
@@ -858,7 +1077,7 @@ def run_masked_image_edit(
         roles = ["scene environment only"] + ["character identity only"] * len(character_paths) + ["product identity only"] * len(product_paths)
         input_urls = [client.upload(path) for path in input_paths]
         mask_url = client.upload(mask_image)
-        prompt = _masked_edit_prompt(clip, scene_prompt or clip.starting_image_prompt)
+        prompt = _masked_edit_prompt(clip, scene_prompt or clip.starting_image_prompt, instructions)
         request = {
             "model": "gpt-image-2-6/sunburst-image-to-image",
             "prompt": prompt,
@@ -871,6 +1090,7 @@ def run_masked_image_edit(
                 "filename": mask_image.name,
                 "role": "editable pixels have transparent alpha; opaque alpha protects the selected scene",
                 "sha256": hashlib.sha256(mask_image.read_bytes()).hexdigest(),
+                "generation": mask_metadata,
             },
             "parameters": {"aspect_ratio": "9:16", "resolution": "1K", "quality": "medium", "output_format": "png", "background": "opaque"},
         }
@@ -975,9 +1195,9 @@ def run_multiclip_generation(
             f"Estimated cost ${operation_cost:.4f} exceeds approved maximum ${approved_max_usd:.4f}"
         )
 
-    reaction_format = plan.hook in {"in_store_reaction", "wet_works"}
+    product_anchored_format = plan.hook in {"in_store_reaction", "wet_works", "countdown_reveal", "gifting"}
     product_paths = [Path(path).expanduser().resolve() for path in (product_references or plan.product_references)]
-    if reaction_format and images_only and all(_product_is_off_frame_at_start(clip) for clip in plan.clips):
+    if product_anchored_format and images_only and all(_product_is_off_frame_at_start(clip) for clip in plan.clips):
         product_paths = []
     # Validate every provider-facing prompt and frame-zero state before provider work.
     validate_starting_image_state(plan)
@@ -985,7 +1205,7 @@ def run_multiclip_generation(
     # block starting-image creation or regeneration.
     video_prompts = {} if images_only else {
         clip.index: compile_video_prompt(
-            plan, clip, product_reference_count=min(6, len(product_paths)) if reaction_format else 0
+            plan, clip, product_reference_count=min(6, len(product_paths)) if product_anchored_format else 0
         ) for clip in plan.clips
     }
     continuity_paths = [Path(path).expanduser().resolve() for path in (continuity_references or plan.continuity_references)]
@@ -1084,7 +1304,7 @@ def run_multiclip_generation(
     # In reaction formats, build the hook and same-scene continuity images before
     # product references. Shot-level visibility below omits irrelevant product
     # photos from off-frame hooks; other formats retain product-first ordering.
-    if reaction_format:
+    if product_anchored_format:
         ordered_clips = sorted(plan.clips, key=lambda clip: (clip.index != 1, clip.index))
     elif any(clip.character_groups for clip in plan.clips):
         # Character references are established in timeline order before later scenes consume them.
@@ -1144,7 +1364,7 @@ def run_multiclip_generation(
         # A single image URL cannot act as two incompatible provider references.
         # Keep it in the character role when a cast anchor is also the scene anchor.
         scene_reference_urls = [url for url in scene_reference_urls if url not in scene_character_urls]
-        product_hidden = reaction_format and _product_is_off_frame_at_start(clip)
+        product_hidden = product_anchored_format and _product_is_off_frame_at_start(clip)
         if product_hidden:
             clip_product_urls = []
         identity_excluded = _product_hidden_at_start(clip.starting_state)
@@ -1156,7 +1376,7 @@ def run_multiclip_generation(
                 request_roles_by_url[product_identity_url] = "product identity only"
                 prompt_roles_by_url[product_identity_url] = "product identity only; ignore background"
         image_references = (
-            scene_reference_urls + scene_character_urls + clip_product_urls if reaction_format else
+            scene_reference_urls + scene_character_urls + clip_product_urls if product_anchored_format else
             clip_product_urls + scene_reference_urls + scene_character_urls
         )
         explicit_roles = (
@@ -1240,7 +1460,7 @@ def run_multiclip_generation(
             video_task = video_record["task_id"]
         else:
             try:
-                video_product_urls = product_reference_urls[:6] if reaction_format else []
+                video_product_urls = product_reference_urls[:6] if product_anchored_format else []
                 video_request = {
                     "prompt": video_prompts[clip.index],
                     "references": [

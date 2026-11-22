@@ -1,8 +1,8 @@
 (() => {
   const $ = (id) => document.getElementById(id);
-  const MAX_INSTRUCTION_LENGTH = 20_000;
+  const MAX_INSTRUCTION_LENGTH = 40_000;
   const DEFAULT_REVIEW_IMAGES_BEFORE_VIDEO = true;
-  const state = { job: null, pollTimer: null, draftTimer: null, savingDraft: false, draftSavePending: false, draftSavePromise: null, videoFile: null, savedVideo: null, removeReferenceVideo: false, productFiles: [], savedProductAssets: [], pendingAction: null, pendingDeleteProjectId: null, pendingDeleteProjectIds: [], selectedProjectIds: new Set(), historyJobs: [], toastTimer: null };
+  const state = { job: null, pollTimer: null, draftTimer: null, savingDraft: false, draftSavePending: false, draftSavePromise: null, videoFile: null, savedVideo: null, removeReferenceVideo: false, productFiles: [], savedProductAssets: [], pendingAction: null, pendingDeleteProjectId: null, pendingDeleteProjectIds: [], selectedProjectIds: new Set(), historyJobs: [], toastTimer: null, editingCreativeDirection: false };
   const activeStates = new Set(['queued', 'analyzing_reference', 'interviewing', 'refining_plan', 'preparing_images', 'generating_clips', 'processing_outputs', 'regenerating', 'regenerating_starting_image']);
   const titles = {
     draft: 'Draft saved', queued: 'Queued for analysis', analyzing_reference: 'Creative Director working', interviewing: 'Interview in progress', ready: 'Ready to generate',
@@ -53,7 +53,10 @@
     $('removeVideo').disabled = locked;
     $('videoInput').disabled = locked;
     $('productInput').disabled = locked;
-    $('instructions').readOnly = locked;
+    $('instructions').readOnly = busy || Boolean(state.job && state.job.status !== 'draft' && !state.editingCreativeDirection);
+    $('editCreativeDirectionButton').disabled = busy;
+    $('saveCreativeDirectionButton').disabled = busy;
+    $('cancelCreativeDirectionButton').disabled = busy;
     $('reviewImagesBeforeVideo').disabled = busy || Boolean(state.job && !['draft', 'ready', 'failed', 'interrupted'].includes(state.job.status));
     $('clipCount').disabled = locked;
     $('clipSeconds').disabled = locked;
@@ -402,7 +405,7 @@
       const imageState = document.createElement('small'); imageState.textContent = `Image ${clip.starting_image_history?.length || 1} · ${clip.duration_seconds}s generated${editLabel}`;
       copy.append(title, action, imageState);
       const edit = document.createElement('div'); edit.className = 'starting-image-edit';
-      const input = document.createElement('textarea'); input.rows = 2; input.maxLength = 1200; input.placeholder = 'Optional image adjustment, such as tool angle or hand placement…'; input.setAttribute('aria-label', `Image adjustment for clip ${clip.index}`);
+      const input = document.createElement('textarea'); input.rows = 2; input.maxLength = 1200; input.placeholder = 'Optional: describe the image change, such as replacing only the character’s clothing…'; input.setAttribute('aria-label', `Image adjustment for standard regeneration or masked edit for clip ${clip.index}`);
       const button = document.createElement('button'); button.type = 'button'; button.className = 'button button-secondary'; button.textContent = 'Regenerate Image · ~$0.03'; button.disabled = !controlsEnabled;
       button.addEventListener('click', async () => {
         try { await performPaidAction(`/api/jobs/${job.id}/clips/${clip.index}/starting-image/regenerate`, { instructions: input.value.trim() }, `Clip ${clip.index} image regeneration`); }
@@ -410,44 +413,62 @@
       });
       edit.append(input, button); card.append(copy, edit); root.append(card);
       const masked = document.createElement('details'); masked.className = 'masked-edit-option';
-      const summary = document.createElement('summary'); summary.textContent = 'Optional: preserve a scene with masked editing';
-      const help = document.createElement('p'); help.textContent = 'Choose a suitable saved scene image as the base. Character identity references follow the saved character groups, preferring approved anchors; provisional images are not approved automatically. The exact-source saved mask is reused when available; otherwise upload a same-size transparent PNG mask. Transparent pixels are editable and opaque pixels protect the background.';
+      const summary = document.createElement('summary'); summary.textContent = 'Optional masked edit · mask created automatically';
+      const help = document.createElement('p'); help.textContent = 'Describe the change in the image adjustment field, then choose a saved scene image. The app identifies and segments the requested object locally, checks the mask against protected regions, and saves it with this candidate. If it cannot isolate the target safely, it stops before the paid image request. Character identity references follow the saved character groups, preferring approved anchors; provisional images are not approved automatically.';
       const base = document.createElement('select'); base.setAttribute('aria-label', `Scene base for clip ${clip.index}`);
       const placeholder = document.createElement('option'); placeholder.value = ''; placeholder.textContent = 'Choose a scene image'; base.append(placeholder);
       const choices = job.scene_base_images || [];
       for (const choice of choices) {
         const option = document.createElement('option'); option.value = choice.value;
-        option.textContent = `${choice.label}${choice.mask_available ? ' · saved mask' : ' · mask upload needed'}`;
+        option.textContent = `${choice.label}${choice.mask_available ? ' · saved mask available' : ' · automatic mask'}`;
         base.append(option);
       }
       const preview = document.createElement('img'); preview.alt = 'Selected scene base preview'; preview.hidden = true;
+      const advanced = document.createElement('details');
+      const advancedSummary = document.createElement('summary'); advancedSummary.textContent = 'Advanced: use an existing mask file';
       const maskFile = document.createElement('input'); maskFile.type = 'file'; maskFile.accept = 'image/png';
-      maskFile.setAttribute('aria-label', `Optional localized alpha mask for clip ${clip.index}`);
-      const maskStatus = document.createElement('small'); maskStatus.textContent = 'No scene selected. The normal regeneration option remains available above.';
+      maskFile.setAttribute('aria-label', `Optional replacement transparent PNG mask for clip ${clip.index}`);
+      advanced.append(advancedSummary, maskFile);
+      const maskStatus = document.createElement('small'); maskStatus.textContent = 'No scene selected.';
       base.addEventListener('change', () => {
         const choice = choices.find((item) => item.value === base.value);
         preview.hidden = !choice;
         if (choice) preview.src = choice.url;
         maskFile.value = '';
         maskStatus.textContent = !choice ? 'No scene selected.' : choice.mask_available
-          ? 'A saved mask for this exact source image will be reused. Upload a replacement mask only if needed.'
-          : 'No saved mask matches this source. Upload a same-size transparent PNG to continue.';
+          ? 'A saved mask for this exact source image will be reused. An automatic mask will be created if needed.'
+          : 'An automatic mask will be created locally for this source image.';
         maskedButton.disabled = !controlsEnabled || !choice;
       });
       const maskedButton = document.createElement('button'); maskedButton.type = 'button'; maskedButton.className = 'button button-secondary';
       maskedButton.textContent = 'Generate Masked Candidate · ~$0.05'; maskedButton.disabled = !controlsEnabled || choices.length === 0;
+      maskStatus.setAttribute('aria-live', 'polite');
       maskedButton.addEventListener('click', async () => {
         const choice = choices.find((item) => item.value === base.value);
         if (!choice) { toast('Choose an appropriate scene image first.'); return; }
+        const instructions = input.value.trim();
+        if (!instructions) { input.focus(); toast('Describe the image change before generating a masked candidate.'); return; }
         const file = maskFile.files?.[0];
-        if (!choice.mask_available && !file) { toast('Upload a transparent PNG mask for this scene image.'); return; }
         const form = new FormData(); form.set('edit_mode', 'masked'); form.set('base_source', choice.value);
-        form.set('instructions', input.value.trim());
+        form.set('instructions', instructions);
         if (file) form.set('mask_image', file, file.name);
-        try { await performPaidAction(`/api/jobs/${job.id}/clips/${clip.index}/starting-image/regenerate`, form, `Clip ${clip.index} masked image edit`); }
-        catch (error) { toast(error.message); }
+        const idleLabel = 'Generate Masked Candidate · ~$0.05';
+        maskedButton.disabled = true;
+        maskedButton.setAttribute('aria-busy', 'true');
+        maskedButton.textContent = 'Preparing Mask…';
+        maskStatus.textContent = 'Creating the mask locally. First use may take a moment while the vision models load.';
+        try {
+          await performPaidAction(`/api/jobs/${job.id}/clips/${clip.index}/starting-image/regenerate`, form, `Clip ${clip.index} masked image edit`);
+        } catch (error) {
+          maskStatus.textContent = `Masked edit failed: ${error.message}`;
+          toast(error.message);
+        } finally {
+          maskedButton.disabled = !controlsEnabled || choices.length === 0;
+          maskedButton.removeAttribute('aria-busy');
+          maskedButton.textContent = idleLabel;
+        }
       });
-      masked.append(summary, help, base, preview, maskFile, maskStatus, maskedButton);
+      masked.append(summary, help, base, preview, maskStatus, advanced, maskedButton);
       card.append(masked);
     });
     approve = $('approveImagesButton');
@@ -481,7 +502,7 @@
     const durationValue = job.duration_selection === 'director' ? 'director' : String(job.seconds_per_clip || 5);
     restoreSelectValue($('clipCount'), countValue, countValue === 'director' ? 'Director decides' : `${countValue} clips`);
     restoreSelectValue($('clipSeconds'), durationValue, durationValue === 'director' ? 'Director decides' : `${durationValue} sec`);
-    $('instructions').value = job.instructions || '';
+    if (!state.editingCreativeDirection) $('instructions').value = job.instructions || '';
     $('characterCount').textContent = `${$('instructions').value.length.toLocaleString()} / ${MAX_INSTRUCTION_LENGTH.toLocaleString()}`;
     $('reviewImagesBeforeVideo').checked = Boolean(job.review_images_before_video || job.status === 'awaiting_image_review');
     const reference = (job.inputs || []).find((asset) => asset.role === 'reference_video');
@@ -501,6 +522,14 @@
     $('directorQuestions').replaceChildren(...(job.director_questions || []).map((question) => { const p = document.createElement('p'); p.textContent = question; return p; }));
     if (job.status === 'interviewing') $('analysisSection').hidden = true;
     $('refinePlanForm').hidden = !(job.status === 'ready' && job.clips?.length);
+    const canEditDirection = Boolean(job.clips?.length) && !activeStates.has(job.status) && job.status !== 'draft';
+    $('creativeDirectionEditor').hidden = !canEditDirection;
+    $('editCreativeDirectionButton').hidden = state.editingCreativeDirection;
+    $('saveCreativeDirectionButton').hidden = !state.editingCreativeDirection;
+    $('cancelCreativeDirectionButton').hidden = !state.editingCreativeDirection;
+    const revision = job.creative_direction_revision;
+    $('creativeDirectionRevisionNote').hidden = !revision;
+    $('creativeDirectionRevisionNote').textContent = revision ? `Last revision affected ${revision.affected_clip_indices?.length ? revision.affected_clip_indices.map((index) => `Clip ${index}`).join(', ') : 'no clips'}.` : '';
     $('updatePlanButton').disabled = activeStates.has(job.status);
     $('generateButton').disabled = (job.status !== 'ready' && !job.can_resume) || job.status === 'awaiting_image_review';
     setBusy(activeStates.has(job.status));
@@ -674,6 +703,26 @@
     zone.addEventListener('drop', (event) => { event.preventDefault(); zone.classList.remove('dragging'); handler(event.dataTransfer.files); });
   });
   $('instructions').addEventListener('input', () => { $('characterCount').textContent = `${$('instructions').value.length.toLocaleString()} / ${MAX_INSTRUCTION_LENGTH.toLocaleString()}`; scheduleDraftSave(); });
+  $('instructions').addEventListener('input', () => {
+    $('creativeDirectionError').hidden = true;
+    $('creativeDirectionError').textContent = '';
+  });
+  $('instructions').addEventListener('paste', (event) => {
+    if (!state.editingCreativeDirection) return;
+    const pastedText = event.clipboardData?.getData('text') || '';
+    const pastedLength = pastedText.replace(/\r\n?/g, '\n').length;
+    const input = $('instructions');
+    const selectedLength = input.selectionEnd - input.selectionStart;
+    const remaining = MAX_INSTRUCTION_LENGTH - (input.value.length - selectedLength);
+    if (pastedLength > remaining) {
+      event.preventDefault();
+      $('creativeDirectionError').textContent = `That paste would exceed 40,000 characters. Only ${Math.max(remaining, 0).toLocaleString()} characters are available at the current selection; no text was pasted.`;
+      $('creativeDirectionError').hidden = false;
+      return;
+    }
+    $('creativeDirectionError').hidden = true;
+    $('creativeDirectionError').textContent = '';
+  });
   $('creationMode').addEventListener('change', () => { updateCreationModeUi(); scheduleDraftSave(); });
   ['hookType', 'clipCount', 'clipSeconds'].forEach((id) => $(id).addEventListener('change', () => scheduleDraftSave()));
   $('reviewImagesBeforeVideo').addEventListener('change', async () => {
@@ -699,7 +748,7 @@
     const original = $('creationMode').value === 'original';
     if (!original && !state.videoFile && !state.savedVideo) { setError('Choose a reference video to continue.'); $('videoDrop').focus(); return; }
     if (!$('instructions').value.trim()) { setError('Add creative instructions before analyzing.'); $('instructions').focus(); return; }
-    if ($('instructions').value.length > MAX_INSTRUCTION_LENGTH) { setError('Keep creative instructions to 20,000 characters or fewer.'); return; }
+    if ($('instructions').value.length > MAX_INSTRUCTION_LENGTH) { setError('Keep creative instructions to 40,000 characters or fewer.'); return; }
     try {
       setBusy(true); $('jobStatusTitle').textContent = 'Saving project'; $('jobStatusMessage').textContent = 'Saving your inputs before analysis.';
       if (!state.job || state.job.status === 'draft') await saveDraft();
@@ -722,6 +771,45 @@
       renderJob(await request(`/api/jobs/${state.job.id}/refine`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ instructions }) }));
       $('refinePlanInput').value = ''; toast('Creative plan updated. Review the clips and estimate.'); await refreshHistory();
     } catch (error) { toast(error.message); $('updatePlanButton').disabled = false; }
+  });
+  $('editCreativeDirectionButton').addEventListener('click', () => {
+    if (!state.job) return;
+    state.editingCreativeDirection = true;
+    $('instructions').value = state.job.instructions || '';
+    $('instructions').readOnly = false;
+    $('creativeDirectionStatus').textContent = 'Edit the full direction; saving revises the plan and preserves existing media.';
+    renderJob(state.job);
+    $('instructions').focus();
+  });
+  $('cancelCreativeDirectionButton').addEventListener('click', () => {
+    if (!state.job) return;
+    state.editingCreativeDirection = false;
+    $('creativeDirectionStatus').textContent = 'Edit the full direction; saving updates the Creative Plan without regenerating media.';
+    renderJob(state.job);
+  });
+  $('saveCreativeDirectionButton').addEventListener('click', async () => {
+    if (!state.job) return;
+    const creative_direction = $('instructions').value;
+    if (!creative_direction.trim()) { toast('Creative Direction cannot be empty.'); return; }
+    if (creative_direction.length > MAX_INSTRUCTION_LENGTH) {
+      $('creativeDirectionError').textContent = `Keep Creative Direction to ${MAX_INSTRUCTION_LENGTH.toLocaleString()} characters or fewer.`;
+      $('creativeDirectionError').hidden = false;
+      $('instructions').focus();
+      return;
+    }
+    try {
+      $('saveCreativeDirectionButton').disabled = true;
+      $('creativeDirectionStatus').textContent = 'Updating the Creative Plan…';
+      const updated = await request(`/api/jobs/${state.job.id}/creative-direction`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ creative_direction }) });
+      state.editingCreativeDirection = false;
+      renderJob(updated);
+      $('creativeDirectionStatus').textContent = updated.message;
+      toast(updated.message);
+      await refreshHistory();
+    } catch (error) {
+      $('creativeDirectionStatus').textContent = error.message;
+      toast(error.message);
+    } finally { $('saveCreativeDirectionButton').disabled = false; }
   });
   $('generateButton').addEventListener('click', async () => {
     if (!state.job) return;
