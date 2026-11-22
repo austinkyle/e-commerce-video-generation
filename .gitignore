@@ -8,3 +8,24 @@ __pycache__/
 .mypy_cache/
 data/
 *.py[cod]
+
+# Local project-specific edit media and Resolve archives stay available on disk,
+# but do not belong in the application source repository.
+video-editing/*/analysis-frames/
+video-editing/*/source-media/
+video-editing/*/output/
+video-editing/*/project/
+video-editing/*/*.drp
+video-editing/*/assets/*.mov
+video-editing/*/assets/*.png
+video-editing/*/assets/*.mp4
+video-editing/*/music/*.mp3
+video-editing/*/music/*.wav
+video-editing/reusable-assets/*/template-test-frame.png
+
+# Common local editor artifacts and interrupted writes.
+.DS_Store
+*.tmp
+*.part
+*.partial
+*.download

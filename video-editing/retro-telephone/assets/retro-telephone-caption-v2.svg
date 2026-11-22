@@ -1,0 +1,7 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1080" height="1920" viewBox="0 0 1080 1920">
+<defs><filter id="tightShadow" x="-10%" y="-10%" width="120%" height="125%"><feGaussianBlur in="SourceAlpha" stdDeviation="1"/><feOffset dx="2" dy="2" result="offset"/><feComponentTransfer><feFuncA type="linear" slope="0.72"/></feComponentTransfer><feMerge><feMergeNode/><feMergeNode in="SourceGraphic"/></feMerge></filter></defs>
+<g fill="#fff" stroke="#050505" stroke-width="6" stroke-linejoin="round" paint-order="stroke fill" filter="url(#tightShadow)" text-anchor="middle" font-family="Arial Narrow" font-weight="700">
+<text x="540" y="310" font-size="88" textLength="600" lengthAdjust="spacingAndGlyphs">80's kids this one's for</text>
+<text x="391" y="402" font-size="72" text-anchor="start">us</text>
+</g><g font-family="Apple Color Emoji" font-size="74"><text x="470" y="402">💞😊📞</text></g>
+</svg>
